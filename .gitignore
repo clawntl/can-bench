@@ -1,0 +1,19 @@
+# Rust build output
+app/target/
+
+# Craft Anything / agent working state (large, generated, or derived from
+# reverse-engineering the proprietary ECU_Hacker.exe)
+agent-session.jsonl
+build-activity.log
+usage.json
+feed.json
+inbox/
+pinned/
+checks/
+investigation.cany/
+capture/
+reference/
+
+# Local app state / logs
+*.log
+*.candump
