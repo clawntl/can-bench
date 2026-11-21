@@ -17,18 +17,26 @@ pub enum AdapterRef {
     Slcan { port: String, label: String },
     /// STM32 bootloader in DFU mode
     Bootloader { id: nusb::DeviceId, label: String },
+    /// `--demo`: virtual adapter with simulated BLDC-Driver nodes (no hardware)
+    Demo { label: String },
 }
+
+/// Set by `--demo`: adds the virtual demo adapter to the adapter list.
+pub static DEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl AdapterRef {
     pub fn label(&self) -> &str {
         match self {
-            AdapterRef::Candle { label, .. } | AdapterRef::Slcan { label, .. } | AdapterRef::Bootloader { label, .. } => label,
+            AdapterRef::Candle { label, .. } | AdapterRef::Slcan { label, .. } | AdapterRef::Bootloader { label, .. } | AdapterRef::Demo { label } => label,
         }
     }
 }
 
 pub fn scan() -> Vec<AdapterRef> {
     let mut out = Vec::new();
+    if DEMO.load(std::sync::atomic::Ordering::Relaxed) {
+        out.push(AdapterRef::Demo { label: "Demo bus – 2 simulated BLDC-Driver nodes (no hardware)".into() });
+    }
     if let Ok(list) = nusb::list_devices().wait() {
         for d in list {
             let vp = (d.vendor_id(), d.product_id());
@@ -150,6 +158,7 @@ pub fn open(cfg: OpenConfig, repaint: impl Fn() + Send + 'static) -> Link {
         let r = match &cfg.adapter {
             AdapterRef::Candle { .. } => run_candle(&cfg, &crx, &send),
             AdapterRef::Slcan { .. } => run_slcan(&cfg, &crx, &send),
+            AdapterRef::Demo { .. } => run_demo(&cfg, &crx, &send),
             AdapterRef::Bootloader { .. } => Err("This adapter is in firmware update (DFU) mode. Leave DFU mode on the Firmware page first.".into()),
         };
         send(Ev::Closed(r.err()));
@@ -511,6 +520,43 @@ fn run_slcan(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Result
     }
 }
 
+fn run_demo(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Result<(), String> {
+    let mut sim = crate::sim::Sim::new();
+    let desc = format!("Demo bus, {} baud (simulated)", timing::fmt_baud(cfg.nominal.0 as f64));
+    send(Ev::Info("Demo bus: nodes 1 and 2 run a simulated BLDC-Driver (protocol 4). Load profiles/bldc-driver.toml on the Device page.".into()));
+    send(Ev::Opened { fd: cfg.data.is_some(), desc });
+    let mut sched = Scheduler::default();
+    let mut out: Vec<(CanFrame, Option<usize>)> = Vec::new();
+    loop {
+        loop {
+            match crx.try_recv() {
+                Ok(Cmd::Send(f)) => out.push((f, None)),
+                Ok(Cmd::SetPeriodic(jobs)) => sched.set(jobs, Instant::now()),
+                Ok(Cmd::Identify(_)) => {}
+                Ok(Cmd::Raw(_)) => send(Ev::Error("Raw commands are only for Slcan adapters.".into(), 1)),
+                Ok(Cmd::Close) | Err(TryRecvError::Disconnected) => return Ok(()),
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        out.extend(sched.due(Instant::now()));
+        for (f, tag) in out.drain(..) {
+            let replies = if cfg.mode == BusMode::ListenOnly { Vec::new() } else { sim.on_frame(&f) };
+            send(Ev::Tx(f.clone(), tag));
+            if cfg.echo {
+                send(Ev::Echo(f));
+            }
+            for r in replies {
+                send(Ev::Rx(r));
+            }
+        }
+        for r in sim.tick() {
+            send(Ev::Rx(r));
+        }
+        let wait = sched.next_in(Instant::now()).map_or(Duration::from_millis(2), |d| d.clamp(Duration::from_millis(1), Duration::from_millis(2)));
+        std::thread::sleep(wait);
+    }
+}
+
 // ===================================================================== firmware tasks
 
 pub enum FwTask {
@@ -572,6 +618,7 @@ fn fw_task(task: FwTask, log: &dyn Fn(String, u8), prog: &dyn Fn(f32, String)) -
     let board = |s: String| log(s, 9);
     match task {
         FwTask::Describe(a) => match a {
+            AdapterRef::Demo { .. } => Err("The demo bus has no firmware.".into()),
             AdapterRef::Candle { id, interface, channel, .. } => with_candle(id, interface, |i| {
                 let info = candle::read_info(i, channel)?;
                 for l in candle::info_lines(&info, channel) {
@@ -646,6 +693,7 @@ fn fw_task(task: FwTask, log: &dyn Fn(String, u8), prog: &dyn Fn(f32, String)) -
         }
         FwTask::EnterDfu(a) => {
             match a {
+                AdapterRef::Demo { .. } => return Err("The demo bus has no firmware.".into()),
                 AdapterRef::Candle { id, .. } => {
                     let ok = with_candle(id, candle::DFU_INTERFACE, candle::enter_dfu)?;
                     if !ok {

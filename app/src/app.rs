@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+mod devtab;
+use devtab::{DevState, OUTPUT_TAG};
+
 const NOMINAL: [u32; 14] = [5_000, 10_000, 20_000, 33_333, 50_000, 62_500, 83_333, 100_000, 125_000, 250_000, 500_000, 800_000, 1_000_000, 0];
 const DATA: [u32; 9] = [1_000_000, 2_000_000, 4_000_000, 5_000_000, 8_000_000, 10_000_000, 500_000, 3_000_000, 0];
 
@@ -103,6 +106,7 @@ struct IdStat {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Terminal,
+    Device,
     Firmware,
 }
 
@@ -179,8 +183,13 @@ pub struct App {
     fw_board: Option<(String, String, String)>,
     fw_identify: bool,
     // screenshot
+    // device profile page
+    dev: DevState,
     shot: Option<PathBuf>,
     frames: u32,
+    started: Instant,
+    shot_delay: Duration,
+    auto: Option<devtab::Auto>,
     shot_requested: bool,
     shot_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -282,8 +291,12 @@ impl App {
             fw_leave: true,
             fw_board: None,
             fw_identify: false,
+            dev: DevState::new(),
             shot,
             frames: 0,
+            started: Instant::now(),
+            shot_delay: Duration::from_millis(2000),
+            auto: None,
             shot_requested: false,
             shot_done: Default::default(),
         };
@@ -296,6 +309,24 @@ impl App {
         app.sync_periodic();
         if std::env::args().any(|a| a == "--firmware") {
             app.tab = Tab::Firmware;
+        }
+        // command-line options used for demos and documentation screenshots
+        let args: Vec<String> = std::env::args().collect();
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+        if let Some(p) = arg("--profile") {
+            app.dev.load(PathBuf::from(p));
+        }
+        if let Some(ms) = arg("--shot-delay").and_then(|v| v.parse().ok()) {
+            app.shot_delay = Duration::from_millis(ms);
+        }
+        if args.iter().any(|a| a == "--open") {
+            app.open(&cc.egui_ctx);
+        }
+        if args.iter().any(|a| a == "--autopilot") {
+            app.auto = Some(devtab::Auto::default());
+        }
+        if std::env::args().any(|a| a == "--device") {
+            app.tab = Tab::Device;
         }
         if std::env::args().any(|a| a == "--periodic") {
             app.show_periodic = true;
@@ -458,21 +489,38 @@ impl App {
                 Ev::Rx(f) => {
                     self.rx_count += 1;
                     self.update_table(&f, at);
+                    let (dec, results) = self.dev.on_frame(&f, at, true);
+                    for (k, t) in results {
+                        self.dev_log(k, t);
+                    }
                     if self.paused {
                         continue;
                     }
                     if self.suppress && !self.seen.insert(f.clone()) {
                         continue;
                     }
-                    self.push(at, Kind::Rx, f.display());
+                    let text = if self.dev.decode_trace && !dec.is_empty() { format!("{}    ⇒ {dec}", f.display()) } else { f.display() };
+                    self.push(at, Kind::Rx, text);
                 }
                 Ev::Tx(f, tag) => {
                     self.tx_count += 1;
-                    if let Some(e) = tag.and_then(|i| self.periodic.get_mut(i)) {
-                        e.sent += 1;
+                    match tag {
+                        Some(i) if i >= OUTPUT_TAG => {
+                            if let Some(o) = self.dev.outputs.get_mut(i - OUTPUT_TAG) {
+                                o.sent += 1;
+                            }
+                        }
+                        Some(i) => {
+                            if let Some(e) = self.periodic.get_mut(i) {
+                                e.sent += 1;
+                            }
+                        }
+                        None => {}
                     }
+                    let (dec, _) = self.dev.on_frame(&f, at, false);
                     if !self.paused && !(tag.is_some() && self.hide_periodic_tx) {
-                        self.push(at, Kind::Tx, f.display());
+                        let text = if self.dev.decode_trace && !dec.is_empty() { format!("{}    ⇒ {dec}", f.display()) } else { f.display() };
+                        self.push(at, Kind::Tx, text);
                     }
                 }
                 Ev::Echo(f) => {
@@ -510,6 +558,10 @@ impl App {
             self.identify = false;
             self.busload = None;
             self.bus_state = ("Closed".into(), 0);
+            // never resume driving outputs by itself when the adapter is opened again
+            for o in &mut self.dev.outputs {
+                o.on = false;
+            }
         }
     }
 
@@ -556,6 +608,11 @@ impl App {
                 Err(err) => e.err = Some(err),
             }
         }
+        let (more, errs) = self.dev.jobs();
+        jobs.extend(more);
+        for e in errs {
+            self.note(Kind::Err, &e);
+        }
         if self.is_open {
             if let Some(l) = &self.link {
                 let _ = l.tx.send(Cmd::SetPeriodic(jobs));
@@ -567,10 +624,11 @@ impl App {
     }
 
     fn stop_periodic(&mut self) {
-        let any = self.periodic.iter().any(|e| e.on);
+        let any = self.periodic.iter().any(|e| e.on) || self.dev.any_output_on();
         if !any {
             return;
         }
+        self.stop_outputs(None);
         for e in &mut self.periodic {
             e.on = false;
         }
@@ -784,7 +842,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.label(RichText::new("CANable 2.5 terminal & firmware updater").color(Color32::from_rgb(180, 195, 225)));
                     ui.add_space(24.0);
-                    for (t, name) in [(Tab::Terminal, "📟  CAN Terminal"), (Tab::Firmware, "⬆  Firmware Update")] {
+                    for (t, name) in [(Tab::Terminal, "📟  CAN Terminal"), (Tab::Device, "🧩  Device"), (Tab::Firmware, "⬆  Firmware Update")] {
                         let on = self.tab == t;
                         let b = egui::Button::new(RichText::new(name).color(if on { Color32::from_rgb(20, 30, 60) } else { Color32::WHITE }))
                             .fill(if on { Color32::from_rgb(220, 230, 250) } else { Color32::from_rgb(55, 76, 125) });
@@ -819,14 +877,20 @@ impl eframe::App for App {
 
         match self.tab {
             Tab::Terminal => self.terminal_ui(ui, &ctx),
+            Tab::Device => self.device_ui(ui),
             Tab::Firmware => self.firmware_ui(ui, &ctx),
+        }
+
+        if self.auto.is_some() {
+            self.autopilot();
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
 
         // --screenshot
         if let Some(path) = self.shot.clone() {
             self.frames += 1;
             ctx.request_repaint();
-            if self.frames >= 120 && !self.shot_requested {
+            if self.frames >= 60 && self.started.elapsed() >= self.shot_delay && !self.shot_requested {
                 self.shot_requested = true;
                 let done = self.shot_done.clone();
                 let c2 = ctx.clone();
@@ -846,7 +910,7 @@ impl eframe::App for App {
                     c2.request_repaint();
                 });
             }
-            if self.shot_done.load(std::sync::atomic::Ordering::SeqCst) || self.frames > 600 {
+            if self.shot_done.load(std::sync::atomic::Ordering::SeqCst) || self.started.elapsed() > self.shot_delay + Duration::from_secs(10) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

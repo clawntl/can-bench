@@ -120,12 +120,12 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// Replaces the job list. A job that already ran with the same frame and period keeps its phase,
-    /// so editing one row does not disturb the timing of the others.
+    /// Replaces the job list. A job that already ran (same tag, CAN ID and period) keeps its phase,
+    /// so changing its data (a slider) or editing another row does not disturb the timing.
     pub fn set(&mut self, jobs: Vec<Job>, now: Instant) {
         let old = std::mem::take(&mut self.jobs);
         for j in jobs {
-            let next = old.iter().find(|(o, _)| o.frame == j.frame && o.period == j.period).map(|(_, t)| *t).unwrap_or(now);
+            let next = old.iter().find(|(o, _)| o.tag == j.tag && o.frame.id == j.frame.id && o.period == j.period).map(|(_, t)| *t).unwrap_or(now);
             self.jobs.push((j, next));
         }
     }
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(s.due(t0 + Duration::from_millis(110)).len(), 1);
         assert_eq!(s.next_in(t0 + Duration::from_millis(110)), Some(Duration::from_millis(10)));
         // same job re-set keeps its phase
-        s.set(vec![Job { tag: 0, frame: f, period: Duration::from_millis(10) }], t0 + Duration::from_millis(111));
+        s.set(vec![Job { tag: 3, frame: f, period: Duration::from_millis(10) }], t0 + Duration::from_millis(111));
         assert_eq!(s.due(t0 + Duration::from_millis(111)).len(), 0);
     }
 }

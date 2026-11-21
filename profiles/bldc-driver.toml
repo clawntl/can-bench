@@ -1,0 +1,284 @@
+# CAN Bench device profile for BLDC-Driver boards (github.com/clawntl/BLDC-Driver),
+# CAN protocol version 4 (Firmware/include/can_protocol.h).
+# Bus: 1 Mbit/s classic CAN, 87.5 % sample point.
+
+name = "BLDC-Driver (protocol 4)"
+
+[nodes]
+range = [1, 15]
+label = "Node"
+heartbeat = "telemetry.status"      # sent every 100 ms, also while FOC is not running
+timeout_ms = 500
+columns = ["status.state", "status.flags", "status.supply", "status.input_current", "velocity.velocity"]
+
+# ---------------------------------------------------------------- board -> host
+[[message]]
+name = "telemetry"
+id = "0x100 + n"
+mux = { byte = 0 }
+
+  [[message.variant]]
+  mux = 0x02
+  name = "velocity"
+  signals = [{ name = "velocity", byte = 1, type = "f32be", unit = "rad/s", decimals = 2 }]
+
+  [[message.variant]]
+  mux = 0x03
+  name = "status"
+  signals = [
+    { name = "state", byte = 1, type = "u8", enum = { 0 = "UNCONFIGURED", 1 = "IDLE", 2 = "RUNNING", 3 = "FAULT" }, alarm = ["FAULT"] },
+    { name = "flags", byte = 2, type = "u8", flags = { 0 = "CMD_TIMEOUT", 1 = "CAL_USED", 2 = "INVERTED", 3 = "DRV_FAULT" }, alarm = ["DRV_FAULT"] },
+    { name = "supply", byte = 3, type = "u16be", scale = 0.001, unit = "V", invalid = 0 },
+    # only boards with CAP_MEASURES_INPUT_CURRENT send these bytes
+    { name = "input_current", byte = 5, type = "i16be", scale = 0.001, unit = "A", invalid = 0x8000 },
+  ]
+
+  [[message.variant]]
+  mux = 0x10
+  name = "start_foc"
+  signals = [{ name = "ok", byte = 1, type = "f32be", decimals = 0 }]   # 1 = ok, 0 = failed
+
+  [[message.variant]]
+  mux = 0x20
+  name = "info"
+  signals = [
+    { name = "protocol", byte = 1, type = "u8" },
+    { name = "fw_major", byte = 2, type = "u8" },
+    { name = "fw_minor", byte = 3, type = "u8" },
+    { name = "fw_patch", byte = 4, type = "u8" },
+    { name = "image_size", byte = 5, type = "u8", unit = "KB" },
+  ]
+
+  [[message.variant]]
+  mux = 0x21
+  name = "config"
+  signals = [
+    { name = "which", byte = 1, type = "u8", enum = { 0 = "active", 1 = "pending" } },
+    { name = "node_id", byte = 2, type = "u8" },
+    { name = "flags", byte = 3, type = "u8", flags = { 0 = "INVERT", 1 = "CALIBRATION", 2 = "SENSOR_CCW", 3 = "UNSAVED" } },
+    { name = "zero_angle", byte = 4, type = "f32be", unit = "rad" },
+  ]
+
+  [[message.variant]]
+  mux = 0x22
+  name = "set_param"
+  signals = [
+    { name = "param", byte = 1, type = "u8", enum = { 1 = "NODE_ID", 2 = "INVERT", 0x10 = "VELOCITY_INTERVAL_MS" } },
+    { name = "status", byte = 2, type = "u8", enum = { 0 = "OK", 1 = "ERR_UNKNOWN", 2 = "ERR_BAD_VALUE", 3 = "ERR_NOT_ALIGNED", 4 = "ERR_FLASH" } },
+    { name = "value", byte = 3, type = "f32be", decimals = 2 },
+  ]
+
+  [[message.variant]]
+  mux = 0x23
+  name = "calibration"
+  signals = [
+    { name = "op", byte = 1, type = "u8", enum = { 1 = "STORE", 2 = "CLEAR" } },
+    { name = "status", byte = 2, type = "u8", enum = { 0 = "OK", 1 = "ERR_UNKNOWN", 2 = "ERR_BAD_VALUE", 3 = "ERR_NOT_ALIGNED", 4 = "ERR_FLASH" } },
+  ]
+
+  [[message.variant]]
+  mux = 0x24
+  name = "save"
+  signals = [{ name = "status", byte = 1, type = "u8", enum = { 0 = "OK", 1 = "ERR_UNKNOWN", 2 = "ERR_BAD_VALUE", 3 = "ERR_NOT_ALIGNED", 4 = "ERR_FLASH" } }]
+
+  [[message.variant]]
+  mux = 0x25
+  name = "revert"
+  signals = [{ name = "status", byte = 1, type = "u8", enum = { 0 = "OK" } }]
+
+  [[message.variant]]
+  mux = 0x26
+  name = "reboot"
+  signals = [{ name = "status", byte = 1, type = "u8", enum = { 0 = "OK" } }]
+
+  [[message.variant]]
+  mux = 0x27
+  name = "board_info"
+  # page 0 only: capabilities + hardware revision (pages 1-5 carry the model name as text)
+  signals = [
+    { name = "page", byte = 1, type = "u8" },
+    { name = "caps", byte = 2, type = "u32be", flags = { 0 = "SUPPLY_V", 1 = "INPUT_I" } },
+    { name = "hw_rev", byte = 6, type = "u8" },
+  ]
+
+  [[message.variant]]
+  mux = 0xFE
+  name = "nack"
+  signals = [
+    { name = "command", byte = 1, type = "u8" },
+    { name = "status", byte = 2, type = "u8", enum = { 1 = "ERR_UNKNOWN", 2 = "ERR_BAD_VALUE" } },
+  ]
+
+  [[message.variant]]
+  mux = 0xFF
+  name = "error"
+  signals = [{ name = "code", byte = 1, type = "f32be", decimals = 0 }]   # 1 motor init, 2 current sense, 3 FOC init, 4 driver fault
+
+# ---------------------------------------------------------------- host -> board
+# Current command: one frame carries two nodes (odd n = bytes 0-3, even n = bytes 4-7).
+# NaN = no command for that node. The board clamps to +-2 A (MOTOR_CURRENT_LIMIT) and
+# applies 0 A if no frame arrives for 100 ms (COMMAND_TIMEOUT_MS).
+[[message]]
+name = "current_cmd"
+id = "0x010 + (n - 1) / 2"
+length = 8
+signals = [
+  { name = "current", byte = "((n - 1) % 2) * 4", type = "f32be", unit = "A", min = -2.0, max = 2.0, default = nan, stop = 0.0, decimals = 3 },
+]
+
+[[message]]
+name = "command"
+id = "0x020 + n"
+mux = { byte = 0 }
+  [[message.variant]]
+  mux = 0x10
+  name = "cmd_start_foc"
+  [[message.variant]]
+  mux = 0x20
+  name = "cmd_get_info"
+  [[message.variant]]
+  mux = 0x21
+  name = "cmd_get_config"
+  signals = [{ name = "which", byte = 1, type = "u8", enum = { 0 = "active", 1 = "pending" } }]
+  [[message.variant]]
+  mux = 0x22
+  name = "cmd_set_param"
+  signals = [
+    { name = "param", byte = 1, type = "u8", enum = { 1 = "NODE_ID", 2 = "INVERT", 0x10 = "VELOCITY_INTERVAL_MS" } },
+    { name = "value", byte = 2, type = "f32be", decimals = 2 },
+  ]
+  [[message.variant]]
+  mux = 0x23
+  name = "cmd_calibration"
+  signals = [{ name = "op", byte = 1, type = "u8", enum = { 1 = "STORE", 2 = "CLEAR" } }]
+  [[message.variant]]
+  mux = 0x24
+  name = "cmd_save"
+  [[message.variant]]
+  mux = 0x25
+  name = "cmd_revert"
+  [[message.variant]]
+  mux = 0x26
+  name = "cmd_reboot"
+  [[message.variant]]
+  mux = 0x27
+  name = "cmd_get_board_info"
+  signals = [{ name = "page", byte = 1, type = "u8" }]
+
+# ---------------------------------------------------------------- outputs (sliders, sent periodically)
+[[output]]
+name = "Motor current"
+message = "current_cmd"
+period_ms = 10
+
+# ---------------------------------------------------------------- command buttons
+[[command]]
+name = "Start FOC"
+id = "0x020 + n"
+data = "10"
+reply_id = "0x100 + n"
+reply = "10"
+timeout_ms = 4000
+help = "Motor init + alignment (1-3 s). Reply ok = 1 / failed = 0."
+
+[[command]]
+name = "Get info"
+id = "0x020 + n"
+data = "20"
+reply_id = "0x100 + n"
+reply = "20"
+nack = "FE 20"
+
+[[command]]
+name = "Get board info"
+id = "0x020 + n"
+data = "27 00"
+reply_id = "0x100 + n"
+reply = "27"
+nack = "FE 27"
+
+[[command]]
+name = "Get config"
+id = "0x020 + n"
+data = "21 {which:u8}"
+args = [{ name = "which", default = 0, min = 0, max = 1 }]
+reply_id = "0x100 + n"
+reply = "21"
+nack = "FE 21"
+help = "which: 0 = active settings, 1 = pending (unsaved) settings"
+
+[[command]]
+name = "Set node ID"
+id = "0x020 + n"
+data = "22 01 {node_id:f32be}"
+args = [{ name = "node_id", default = 1, min = 1, max = 15 }]
+reply_id = "0x100 + n"
+reply = "22"
+nack = "FE 22"
+confirm = true
+help = "Pending until Save (which reboots). The board's CAN IDs change after the reboot!"
+
+[[command]]
+name = "Set invert"
+id = "0x020 + n"
+data = "22 02 {invert:f32be}"
+args = [{ name = "invert", default = 0, min = 0, max = 1 }]
+reply_id = "0x100 + n"
+reply = "22"
+nack = "FE 22"
+help = "Pending until Save."
+
+[[command]]
+name = "Set velocity interval"
+id = "0x020 + n"
+data = "22 10 {value:f32be}"
+args = [{ name = "value", default = 10, min = 1, max = 100 }]
+reply_id = "0x100 + n"
+reply = "22"
+nack = "FE 22"
+help = "Velocity telemetry period in ms. Runtime only: back to 10 ms after a reset."
+
+[[command]]
+name = "Store calibration"
+id = "0x020 + n"
+data = "23 01"
+reply_id = "0x100 + n"
+reply = "23"
+nack = "FE 23"
+help = "Keep this boot's FOC alignment (FOC must be running). Pending until Save."
+
+[[command]]
+name = "Clear calibration"
+id = "0x020 + n"
+data = "23 02"
+reply_id = "0x100 + n"
+reply = "23"
+nack = "FE 23"
+
+[[command]]
+name = "Save"
+id = "0x020 + n"
+data = "24"
+reply_id = "0x100 + n"
+reply = "24"
+nack = "FE 24"
+confirm = true
+help = "Stops the motor, writes the pending settings to flash and reboots."
+
+[[command]]
+name = "Revert"
+id = "0x020 + n"
+data = "25"
+reply_id = "0x100 + n"
+reply = "25"
+nack = "FE 25"
+help = "Discard unsaved changes."
+
+[[command]]
+name = "Reboot"
+id = "0x020 + n"
+data = "26"
+reply_id = "0x100 + n"
+reply = "26"
+nack = "FE 26"
+confirm = true

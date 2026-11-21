@@ -7,6 +7,8 @@ mod device;
 mod dfu;
 mod dfufile;
 mod periodic;
+mod profile;
+mod sim;
 mod slcan;
 mod timing;
 
@@ -16,6 +18,9 @@ use std::path::PathBuf;
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let shot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    if args.iter().any(|a| a == "--demo") {
+        device::DEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("CAN Bench – CANable terminal & firmware updater")
