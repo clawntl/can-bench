@@ -17,3 +17,7 @@ reference/
 # Local app state / logs
 *.log
 *.candump
+
+# Not part of the repo
+craft.json
+app/shots/
