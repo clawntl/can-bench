@@ -740,7 +740,9 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_plot(&mut self, ui: &mut egui::Ui, id: &str, lines: &[(String, Option<i64>, String, Color32)], secs: f64, height: f32, min_range: Option<f64>, gap_ms: u64) {
-        let now = self.dev.t0.elapsed().as_secs_f64();
+        // x = seconds before now, so the grid and its labels stay still and only the data moves.
+        // While the adapter is closed the time axis stands still (nothing new can arrive).
+        let now = self.dev.plot_now(self.is_open);
         let gap = gap_ms as f64 / 1000.0;
         let mut plot = egui_plot::Plot::new(id.to_string())
             .height(height)
@@ -751,7 +753,7 @@ impl App {
             .show_x(false)
             .y_axis_min_width(40.0)
             .y_grid_spacer(egui_plot::log_grid_spacer(5))
-            .x_axis_formatter(move |m, _| format!("{:.0} s", m.value - now));
+            .x_axis_formatter(|m, _| if m.value.abs() < 1e-9 { "now".to_string() } else { format!("{:.0} s", m.value) });
         if let Some(r) = min_range {
             plot = plot.include_y(r).include_y(-r);
         }
@@ -772,7 +774,7 @@ impl App {
                         pui.line(egui_plot::Line::new(name.clone(), std::mem::take(&mut seg)).color(*col).width(2.0));
                         first = false;
                     }
-                    seg.push(*p);
+                    seg.push([p[0] - now, p[1]]);
                     prev_t = p[0];
                     any = true;
                 }
@@ -782,10 +784,11 @@ impl App {
                 }
             }
             pui.set_auto_bounds([false, true]);
-            pui.set_plot_bounds_x(now - secs..=now);
+            pui.set_plot_bounds_x(-secs..=0.0);
         });
-        // smooth scrolling: repaint every frame while the plot is moving
-        if self.is_open || any {
+        let _ = any;
+        // smooth scrolling: repaint every frame while time moves (adapter open)
+        if self.is_open {
             ui.ctx().request_repaint();
         }
     }

@@ -115,6 +115,8 @@ pub struct DevState {
     pub(super) plot_secs: f64,
     pub(super) follow: bool,
     pub(super) t0: Instant,
+    /// plot time while the adapter is closed (the plots stand still)
+    pub(super) frozen_at: Option<f64>,
     pub(super) confirm: Option<Confirm>,
     pub(super) filter: String,
     // dashboard
@@ -161,6 +163,7 @@ impl DevState {
             plot_secs: 10.0,
             follow: true,
             t0: Instant::now(),
+            frozen_at: None,
             confirm: None,
             filter: String::new(),
             layout: Vec::new(),
@@ -570,6 +573,17 @@ impl DevState {
         self.outputs.iter().any(|o| !o.nodes.is_empty()) || self.running.is_some()
     }
 
+    /// Seconds since `t0` for the plots: running while the adapter is open, frozen while closed.
+    pub(super) fn plot_now(&mut self, open: bool) -> f64 {
+        let t = self.t0.elapsed().as_secs_f64();
+        if open {
+            self.frozen_at = None;
+            t
+        } else {
+            *self.frozen_at.get_or_insert(t)
+        }
+    }
+
     pub(super) fn reset_seen(&mut self) {
         self.signals.clear();
         self.heard.clear();
@@ -577,6 +591,7 @@ impl DevState {
         self.counts.clear();
         self.rates.clear();
         self.t0 = Instant::now();
+        self.frozen_at = None;
     }
 }
 
