@@ -1,0 +1,13 @@
+# CAN Bench: let normal users open CANable 2.5 adapters without root.
+# Install:  sudo cp 99-can-bench.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# Then unplug and replug the adapter.
+
+# CANable 2.5 Candlelight firmware (WinUSB / gs_usb). CAN Bench detaches the kernel gs_usb driver
+# while it has the adapter open; it reattaches when you unplug the adapter.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", MODE="0660", TAG+="uaccess"
+
+# CANable 2.5 Slcan firmware (USB CDC serial port, /dev/ttyACM*)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="117e", MODE="0660", TAG+="uaccess"
+
+# STM32 ROM bootloader in DFU mode (firmware update)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", MODE="0660", TAG+="uaccess"

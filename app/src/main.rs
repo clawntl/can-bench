@@ -6,6 +6,7 @@ mod candle;
 mod device;
 mod dfu;
 mod dfufile;
+mod periodic;
 mod slcan;
 mod timing;
 

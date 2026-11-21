@@ -87,7 +87,7 @@ pub fn status_text(s: u8) -> &'static str {
 
 impl Dfu {
     pub fn open(dev: &nusb::Device) -> Result<Self, String> {
-        let intf = dev.claim_interface(0).wait().map_err(|e| {
+        let intf = dev.detach_and_claim_interface(0).wait().map_err(|e| {
             format!(
                 "Cannot open the STM32 bootloader ({e}). It needs the WinUSB driver: install it once for \"STM32 BOOTLOADER\" \
                  (for example with STM32CubeProgrammer's DFU driver or Zadig → WinUSB)."

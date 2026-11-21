@@ -2,6 +2,7 @@
 
 use crate::can::{CanFrame, HostFilter};
 use crate::timing::{self, Limits, Timing};
+use crate::periodic::{Job, Scheduler};
 use crate::{candle, dfu, dfufile, slcan};
 use nusb::MaybeFuture;
 use std::path::PathBuf;
@@ -59,6 +60,10 @@ pub fn scan() -> Vec<AdapterRef> {
     }
     if let Ok(ports) = serialport::available_ports() {
         for p in ports {
+            // macOS lists every port twice: /dev/tty.* (waits for carrier) and /dev/cu.* (use this one)
+            if cfg!(target_os = "macos") && p.port_name.starts_with("/dev/tty.") {
+                continue;
+            }
             if let serialport::SerialPortType::UsbPort(u) = &p.port_type {
                 let known = slcan::IDS.contains(&(u.vid, u.pid));
                 let prod = u.product.clone().unwrap_or_else(|| "USB serial".into());
@@ -108,6 +113,8 @@ pub struct OpenConfig {
 
 pub enum Cmd {
     Send(CanFrame),
+    /// Replace the periodic transmit list (empty = stop all).
+    SetPeriodic(Vec<Job>),
     Identify(bool),
     Raw(String),
     Close,
@@ -119,7 +126,8 @@ pub enum Ev {
     Text(String),
     Error(String, u8),
     Rx(CanFrame),
-    Tx(CanFrame),
+    /// A frame was written to the adapter; Some(row) when it came from the periodic list.
+    Tx(CanFrame, Option<usize>),
     Echo(CanFrame),
     Busload(u8),
     Opened { fd: bool, desc: String },
@@ -192,7 +200,7 @@ fn run_candle(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Resul
     let AdapterRef::Candle { id, interface, channel, .. } = cfg.adapter.clone() else { unreachable!() };
     let dev = open_usb(id)?;
     let intf = dev
-        .claim_interface(interface)
+        .detach_and_claim_interface(interface)
         .wait()
         .map_err(|e| format!("Cannot claim the adapter (is it open in another program?): {e}"))?;
     let dd = dev.device_descriptor();
@@ -273,27 +281,13 @@ fn run_candle(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Resul
     let mut echoed: u8 = 0;
     let mut sent: Vec<Option<CanFrame>> = vec![None; 256];
     let mut errors = 0;
+    let mut sched = Scheduler::default();
+    let mut out: Vec<(CanFrame, Option<usize>)> = Vec::new();
     loop {
         loop {
             match crx.try_recv() {
-                Ok(Cmd::Send(f)) => {
-                    // free Tx slots = 64 - (tx marker - last echoed marker), wrap at 255 (ECU_Hacker 0x0600214e)
-                    if cfg.echo && candle::free_tx_slots(marker, echoed) == 0 {
-                        send(Ev::Error(candle::feedback_text(b'7'), 2));
-                        continue;
-                    }
-                    let m = if cfg.echo {
-                        marker = if marker == 255 { 1 } else { marker + 1 };
-                        sent[marker as usize] = Some(f.clone());
-                        marker
-                    } else {
-                        0
-                    };
-                    match c.write(&candle::tx_bytes(&f, m)) {
-                        Ok(()) => send(Ev::Tx(f)),
-                        Err(e) => send(Ev::Error(e, 2)),
-                    }
-                }
+                Ok(Cmd::Send(f)) => out.push((f, None)),
+                Ok(Cmd::SetPeriodic(jobs)) => sched.set(jobs, Instant::now()),
                 Ok(Cmd::Identify(on)) => {
                     // needs capability flag 0x20 (ECU_Hacker 0x06002148)
                     if info.feature & candle::F_IDENTIFY == 0 {
@@ -310,7 +304,27 @@ fn run_candle(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Resul
                 Err(TryRecvError::Empty) => break,
             }
         }
-        match c.poll(Duration::from_millis(10)) {
+        out.extend(sched.due(Instant::now()));
+        for (f, tag) in out.drain(..) {
+            // free Tx slots = 64 - (tx marker - last echoed marker), wrap at 255 (ECU_Hacker 0x0600214e)
+            if cfg.echo && candle::free_tx_slots(marker, echoed) == 0 {
+                send(Ev::Error(candle::feedback_text(b'7'), 2));
+                continue;
+            }
+            let m = if cfg.echo {
+                marker = if marker == 255 { 1 } else { marker + 1 };
+                sent[marker as usize] = Some(f.clone());
+                marker
+            } else {
+                0
+            };
+            match c.write(&candle::tx_bytes(&f, m)) {
+                Ok(()) => send(Ev::Tx(f, tag)),
+                Err(e) => send(Ev::Error(e, 2)),
+            }
+        }
+        let wait = sched.next_in(Instant::now()).map_or(Duration::from_millis(10), |d| d.clamp(Duration::from_millis(1), Duration::from_millis(10)));
+        match c.poll(wait) {
             Ok(Some(buf)) => {
                 errors = 0;
                 for m in candle::parse_in(&buf) {
@@ -449,23 +463,13 @@ fn run_slcan(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Result
     for l in other.drain(..) {
         handle(l, &mut sent);
     }
+    let mut sched = Scheduler::default();
+    let mut out: Vec<(CanFrame, Option<usize>)> = Vec::new();
     loop {
         loop {
             match crx.try_recv() {
-                Ok(Cmd::Send(f)) => {
-                    let m = if use_marker {
-                        marker = if marker == 255 { 1 } else { marker + 1 };
-                        sent[marker as usize] = Some(f.clone());
-                        Some(marker)
-                    } else {
-                        None
-                    };
-                    let cmd = slcan::frame_cmd(&f, m);
-                    match s.send_raw(&format!("{cmd}\r")) {
-                        Ok(()) => send(Ev::Tx(f)),
-                        Err(e) => send(Ev::Error(e, 2)),
-                    }
-                }
+                Ok(Cmd::Send(f)) => out.push((f, None)),
+                Ok(Cmd::SetPeriodic(jobs)) => sched.set(jobs, Instant::now()),
                 Ok(Cmd::Identify(on)) => {
                     let _ = s.send_raw(if on { "MI\r" } else { "Mi\r" });
                 }
@@ -478,6 +482,21 @@ fn run_slcan(cfg: &OpenConfig, crx: &Receiver<Cmd>, send: &dyn Fn(Ev)) -> Result
                     return Ok(());
                 }
                 Err(TryRecvError::Empty) => break,
+            }
+        }
+        out.extend(sched.due(Instant::now()));
+        for (f, tag) in out.drain(..) {
+            let m = if use_marker {
+                marker = if marker == 255 { 1 } else { marker + 1 };
+                sent[marker as usize] = Some(f.clone());
+                Some(marker)
+            } else {
+                None
+            };
+            let cmd = slcan::frame_cmd(&f, m);
+            match s.send_raw(&format!("{cmd}\r")) {
+                Ok(()) => send(Ev::Tx(f, tag)),
+                Err(e) => send(Ev::Error(e, 2)),
             }
         }
         s.pump().map_err(|e| format!("{e} – the adapter was probably disconnected."))?;
@@ -535,7 +554,7 @@ pub fn run_fw(task: FwTask, repaint: impl Fn() + Send + 'static) -> Receiver<FwE
 
 fn with_candle<T>(id: nusb::DeviceId, interface: u8, f: impl FnOnce(&nusb::Interface) -> Result<T, String>) -> Result<T, String> {
     let dev = open_usb(id)?;
-    let intf = dev.claim_interface(interface).wait().map_err(|e| format!("Cannot claim the adapter (close it in the terminal first): {e}"))?;
+    let intf = dev.detach_and_claim_interface(interface).wait().map_err(|e| format!("Cannot claim the adapter (close it in the terminal first): {e}"))?;
     f(&intf)
 }
 

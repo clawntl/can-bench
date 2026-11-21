@@ -3,6 +3,7 @@
 use crate::can::{self, CanFrame};
 use crate::device::{self, AdapterRef, BusMode, Cmd, Ev, FwEv, FwTask, Link, OpenConfig};
 use crate::dfufile;
+use crate::periodic::{self, Entry, Job, TxSpec};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
@@ -154,15 +155,11 @@ pub struct App {
     base_inst: Instant,
     base_wall: chrono::DateTime<chrono::Local>,
     // send
-    tx_id: String,
-    tx_data: String,
-    tx_ext: bool,
-    tx_fd: bool,
-    tx_brs: bool,
-    tx_rtr: bool,
-    repeat: bool,
-    repeat_ms: u32,
-    last_repeat: Instant,
+    tx: TxSpec,
+    // periodic transmit
+    periodic: Vec<Entry>,
+    show_periodic: bool,
+    hide_periodic_tx: bool,
     raw_cmd: String,
     // stats
     rx_count: u64,
@@ -189,15 +186,25 @@ pub struct App {
 }
 
 fn own_firmware_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    // Windows: %APPDATA%; macOS: ~/Library/Application Support; Linux: $XDG_DATA_HOME or ~/.local/share
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| home().map(|h| h.join(".local").join("share")))
+    }
+    .unwrap_or_else(|| PathBuf::from("."));
     base.join("CanBench").join("Firmware")
 }
 
 fn theme_file() -> PathBuf {
     own_firmware_dir().parent().map(|p| p.join("theme.txt")).unwrap_or_else(|| PathBuf::from("theme.txt"))
+}
+
+fn periodic_file() -> PathBuf {
+    own_firmware_dir().parent().map(|p| p.join("periodic.json")).unwrap_or_else(|| PathBuf::from("periodic.json"))
 }
 
 fn apply_theme(ctx: &egui::Context, dark: bool) {
@@ -255,15 +262,10 @@ impl App {
             logfile: None,
             base_inst: Instant::now(),
             base_wall: chrono::Local::now(),
-            tx_id: "123".into(),
-            tx_data: "11 22 33 44 55 66 77 88".into(),
-            tx_ext: false,
-            tx_fd: false,
-            tx_brs: false,
-            tx_rtr: false,
-            repeat: false,
-            repeat_ms: 100,
-            last_repeat: Instant::now(),
+            tx: TxSpec::default(),
+            periodic: periodic::load(&periodic_file()),
+            show_periodic: false,
+            hide_periodic_tx: false,
             raw_cmd: String::new(),
             rx_count: 0,
             tx_count: 0,
@@ -291,8 +293,12 @@ impl App {
         app.note(Kind::Info, "Purple: adapter information");
         app.refresh();
         app.scan_firmware();
+        app.sync_periodic();
         if std::env::args().any(|a| a == "--firmware") {
             app.tab = Tab::Firmware;
+        }
+        if std::env::args().any(|a| a == "--periodic") {
+            app.show_periodic = true;
         }
         app
     }
@@ -460,9 +466,12 @@ impl App {
                     }
                     self.push(at, Kind::Rx, f.display());
                 }
-                Ev::Tx(f) => {
+                Ev::Tx(f, tag) => {
                     self.tx_count += 1;
-                    if !self.paused {
+                    if let Some(e) = tag.and_then(|i| self.periodic.get_mut(i)) {
+                        e.sent += 1;
+                    }
+                    if !self.paused && !(tag.is_some() && self.hide_periodic_tx) {
                         self.push(at, Kind::Tx, f.display());
                     }
                 }
@@ -484,6 +493,7 @@ impl App {
                     self.link_desc = desc;
                     self.bus_state = ("Bus Active".into(), 0);
                     self.push(at, Kind::Note, "Adapter is open".into());
+                    self.sync_periodic();
                 }
                 Ev::Closed(err) => {
                     if let Some(e) = err {
@@ -519,43 +529,133 @@ impl App {
         }
     }
 
-    fn build_frame(&self) -> Result<CanFrame, String> {
-        let id = can::parse_hex_u32(&self.tx_id).ok_or("Enter the CAN ID in hex, e.g. 123 or 18DAF110")?;
-        let ext = self.tx_ext || id > 0x7FF || self.tx_id.trim().len() > 3;
-        if (!ext && id > 0x7FF) || id > 0x1FFF_FFFF {
-            return Err("The CAN ID is too big".into());
-        }
-        let fd = self.tx_fd;
-        if fd && !self.link_fd {
-            return Err("CAN FD packets need 'CAN FD' to be ticked before opening.".into());
-        }
-        let mut data = if self.tx_rtr { Vec::new() } else { can::parse_hex_bytes(&self.tx_data)? };
-        if self.tx_rtr {
-            if fd {
-                return Err("Remote frames do not exist in CAN FD".into());
-            }
-            let n = can::parse_hex_bytes(&self.tx_data).map(|v| v.len()).unwrap_or(0).min(8);
-            data.push(n as u8);
-        } else {
-            if data.len() > if fd { 64 } else { 8 } {
-                return Err(format!("Too many data bytes ({}), max {}", data.len(), if fd { 64 } else { 8 }));
-            }
-            can::pad(&mut data, fd, self.pad8);
-        }
-        Ok(CanFrame { id, ext, rtr: self.tx_rtr, fd, brs: fd && self.tx_brs, esi: false, data })
-    }
-
     fn send(&mut self) {
-        match self.build_frame() {
+        match self.tx.build(self.link_fd, self.pad8) {
             Ok(f) => {
                 if let Some(l) = &self.link {
                     let _ = l.tx.send(Cmd::Send(f));
                 }
             }
-            Err(e) => {
-                self.repeat = false;
-                self.note(Kind::Err, &e);
+            Err(e) => self.note(Kind::Err, &e),
+        }
+    }
+
+    /// Validates every row, sends the enabled ones to the adapter thread and saves the list.
+    fn sync_periodic(&mut self) {
+        let mut jobs = Vec::new();
+        for (i, e) in self.periodic.iter_mut().enumerate() {
+            // before opening, FD rows are checked against the 'CAN FD' tick box
+            let fd_ok = if self.is_open { self.link_fd } else { self.fd };
+            match e.spec.build(fd_ok, self.pad8) {
+                Ok(frame) => {
+                    e.err = None;
+                    if e.on {
+                        jobs.push(Job { tag: i, frame, period: Duration::from_millis(e.period_ms.max(1) as u64) });
+                    }
+                }
+                Err(err) => e.err = Some(err),
             }
+        }
+        if self.is_open {
+            if let Some(l) = &self.link {
+                let _ = l.tx.send(Cmd::SetPeriodic(jobs));
+            }
+        }
+        if let Err(e) = periodic::save(&periodic_file(), &self.periodic) {
+            self.note(Kind::Warn, &format!("Cannot save the periodic list: {e}"));
+        }
+    }
+
+    fn stop_periodic(&mut self) {
+        let any = self.periodic.iter().any(|e| e.on);
+        if !any {
+            return;
+        }
+        for e in &mut self.periodic {
+            e.on = false;
+        }
+        self.sync_periodic();
+        self.note(Kind::Note, "Periodic transmit stopped");
+    }
+
+    fn periodic_ui(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        let mut remove = None;
+        let mut to_send_bar = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Periodic transmit").strong().color(th((40, 70, 140), (130, 170, 240))));
+            if ui.button("⏹ Stop all  (Esc)").on_hover_text("Untick every row. Esc works anywhere in the window.").clicked() {
+                self.stop_periodic();
+            }
+            if ui.button("▶ Start all").clicked() {
+                for e in &mut self.periodic {
+                    e.on = true;
+                    e.sent = 0;
+                }
+                changed = true;
+            }
+            if ui.button("➕ Add row from Send bar").clicked() {
+                self.periodic.push(Entry::new(self.tx.clone()));
+                changed = true;
+            }
+            ui.checkbox(&mut self.hide_periodic_tx, "Hide periodic Tx in trace");
+            if !self.is_open {
+                ui.label(RichText::new("Ticked rows start sending when the adapter is open.").color(C_TIME()));
+            }
+        });
+        if self.periodic.is_empty() {
+            ui.label(RichText::new("No rows yet. Fill in the Send bar and click '➕ Add row from Send bar'.").color(C_TIME()));
+            return;
+        }
+        let fd_ok = self.fd;
+        let h = ui.spacing().interact_size.y;
+        let rows_h = (self.periodic.len() + 1) as f32 * (h + 4.0) + 4.0;
+        egui::ScrollArea::vertical().max_height(200.0).min_scrolled_height(rows_h.min(200.0)).show(ui, |ui| {
+            egui::Grid::new("periodic").num_columns(13).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
+                for h in ["On", "Name", "ID", "Data", "29 bit", "RTR", "FD", "BRS", "Every", "Sent", "", "", ""] {
+                    ui.label(RichText::new(h).strong());
+                }
+                ui.end_row();
+                for (i, e) in self.periodic.iter_mut().enumerate() {
+                    let before = (e.on, e.spec.clone(), e.period_ms, e.name.clone());
+                    if ui.checkbox(&mut e.on, "").changed() && e.on {
+                        e.sent = 0;
+                    }
+                    ui.add_sized([150.0, h], egui::TextEdit::singleline(&mut e.name).hint_text("name"));
+                    ui.add_sized([80.0, h], egui::TextEdit::singleline(&mut e.spec.id).font(egui::TextStyle::Monospace));
+                    ui.add_sized([260.0, h], egui::TextEdit::singleline(&mut e.spec.data).font(egui::TextStyle::Monospace));
+                    ui.checkbox(&mut e.spec.ext, "");
+                    ui.checkbox(&mut e.spec.rtr, "");
+                    ui.add_enabled(fd_ok || e.spec.fd, egui::Checkbox::without_text(&mut e.spec.fd));
+                    ui.add_enabled(e.spec.fd, egui::Checkbox::without_text(&mut e.spec.brs));
+                    ui.add(egui::DragValue::new(&mut e.period_ms).range(1..=60_000).suffix(" ms"));
+                    ui.label(RichText::new(e.sent.to_string()).monospace().color(C_TX()));
+                    if ui.small_button("⬆").on_hover_text("Copy into the Send bar").clicked() {
+                        to_send_bar = Some(e.spec.clone());
+                    }
+                    if ui.small_button("✖").on_hover_text("Delete this row").clicked() {
+                        remove = Some(i);
+                    }
+                    match &e.err {
+                        Some(err) => ui.label(RichText::new(err).small().color(C_ERR())),
+                        None => ui.label(""),
+                    };
+                    ui.end_row();
+                    if before != (e.on, e.spec.clone(), e.period_ms, e.name.clone()) {
+                        changed = true;
+                    }
+                }
+            });
+        });
+        if let Some(i) = remove {
+            self.periodic.remove(i);
+            changed = true;
+        }
+        if let Some(t) = to_send_bar {
+            self.tx = t;
+        }
+        if changed {
+            self.sync_periodic();
         }
     }
 
@@ -669,12 +769,8 @@ impl eframe::App for App {
         self.poll_link();
         self.poll_fw();
 
-        if self.repeat && self.is_open && self.last_repeat.elapsed() >= Duration::from_millis(self.repeat_ms.max(1) as u64) {
-            self.last_repeat = Instant::now();
-            self.send();
-        }
-        if self.repeat && self.is_open {
-            ctx.request_repaint_after(Duration::from_millis(self.repeat_ms.clamp(1, 1000) as u64));
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.stop_periodic();
         }
         if self.link.is_some() || self.fw_busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -868,15 +964,15 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Send").strong().color(th((40, 70, 140), (130, 170, 240))));
                 ui.label("ID:");
-                ui.add(egui::TextEdit::singleline(&mut self.tx_id).desired_width(80.0).font(egui::TextStyle::Monospace));
+                ui.add(egui::TextEdit::singleline(&mut self.tx.id).desired_width(80.0).font(egui::TextStyle::Monospace));
                 ui.label("Data:");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.tx_data).desired_width(300.0).font(egui::TextStyle::Monospace).hint_text("hex bytes"));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.tx.data).desired_width(300.0).font(egui::TextStyle::Monospace).hint_text("hex bytes"));
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                ui.checkbox(&mut self.tx_ext, "29 bit");
-                ui.checkbox(&mut self.tx_rtr, "RTR");
+                ui.checkbox(&mut self.tx.ext, "29 bit");
+                ui.checkbox(&mut self.tx.rtr, "RTR");
                 ui.add_enabled_ui(self.fd, |ui| {
-                    ui.checkbox(&mut self.tx_fd, "FD");
-                    ui.add_enabled(self.tx_fd, egui::Checkbox::new(&mut self.tx_brs, "BRS"));
+                    ui.checkbox(&mut self.tx.fd, "FD");
+                    ui.add_enabled(self.tx.fd, egui::Checkbox::new(&mut self.tx.brs, "BRS"));
                 });
                 ui.checkbox(&mut self.pad8, "Pad to 8");
                 let send = ui.add_enabled(self.is_open, egui::Button::new(RichText::new("Send").strong()).fill(th((205, 220, 250), (45, 70, 120))));
@@ -884,9 +980,14 @@ impl App {
                     self.send();
                 }
                 ui.separator();
-                ui.add_enabled(self.is_open, egui::Checkbox::new(&mut self.repeat, "Repeat every"));
-                ui.add(egui::DragValue::new(&mut self.repeat_ms).range(1..=60_000).suffix(" ms"));
+                let active = self.periodic.iter().filter(|e| e.on).count();
+                let label = if active > 0 { format!("⏱ Periodic ({active} on)") } else { "⏱ Periodic".to_string() };
+                ui.toggle_value(&mut self.show_periodic, label).on_hover_text("Frames sent automatically at a fixed interval");
             });
+            if self.show_periodic {
+                ui.separator();
+                self.periodic_ui(ui);
+            }
             if matches!(self.selected(), Some(AdapterRef::Slcan { .. })) && self.is_open {
                 ui.horizontal(|ui| {
                     ui.label("Slcan command:");
@@ -1141,7 +1242,7 @@ impl App {
                     }
                     if ui.button("📂").on_hover_text("Open the firmware folder").clicked() {
                         let _ = std::fs::create_dir_all(&self.own_fw_dir);
-                        let _ = std::process::Command::new(if cfg!(windows) { "explorer" } else { "xdg-open" }).arg(&self.own_fw_dir).spawn();
+                        let _ = std::process::Command::new(if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(&self.own_fw_dir).spawn();
                     }
                 });
             });
