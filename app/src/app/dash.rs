@@ -106,7 +106,8 @@ impl App {
                     "tx" => self.tx_count.to_string(),
                     k => match self.sig_text(k, node) {
                         Some((t, _, age, _)) => {
-                            if stale_ms.is_some_and(|s| age.as_millis() as u64 > s) {
+                            // with stale_ms, "no value" (NaN / invalid) counts as missing too
+                            if stale_ms.is_some_and(|s| age.as_millis() as u64 > s || t == "NaN" || t == "–") {
                                 return None;
                             }
                             t
@@ -282,6 +283,8 @@ impl App {
             x += w + gap;
             let cards = self.dev.layout[ci].clone();
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                // nothing in a column may draw into the next one
+                ui.set_clip_rect(rect.intersect(ui.clip_rect()));
                 egui::ScrollArea::vertical().id_salt(("dash_col", ci)).auto_shrink([false, false]).show(ui, |ui| {
                     if editing {
                         ui.horizontal(|ui| {
@@ -811,7 +814,11 @@ impl App {
                         if l.kind == Kind::Note {
                             t = t.strong();
                         }
-                        ui.label(t);
+                        // one line per entry (fixed row height); long ones end in … with the full text on hover
+                        let r = ui.add(egui::Label::new(t).truncate());
+                        if r.hovered() && l.text.len() > 40 {
+                            r.on_hover_text(&l.text);
+                        }
                     });
                 }
             });
