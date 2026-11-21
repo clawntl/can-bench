@@ -1,8 +1,18 @@
 # CAN Bench device profile for BLDC-Driver boards (github.com/clawntl/BLDC-Driver),
 # CAN protocol version 4 (Firmware/include/can_protocol.h).
-# Bus: 1 Mbit/s classic CAN, 87.5 % sample point.
+#
+# The Device page this profile builds replaces Firmware/tools/can_test/cantest_gui.py:
+# two motor cards (node chosen per card), Start FOC / Send / current slider with presets,
+# Auto test and Bus-off test, Info, a Settings window, "Start FOC both", linked sliders,
+# STOP (Esc), velocity + commanded-current plots and an event log.
+#
+# SAFETY: the motors WILL spin. Clamp them or lift the wheels.
 
 name = "BLDC-Driver (protocol 4)"
+
+[bus]
+bitrate = 1000000            # classic CAN 2.0B, no FD
+sample_point = 87.5
 
 [nodes]
 range = [1, 15]
@@ -11,7 +21,7 @@ heartbeat = "telemetry.status"      # sent every 100 ms, also while FOC is not r
 timeout_ms = 500
 columns = ["status.state", "status.flags", "status.supply", "status.input_current", "velocity.velocity"]
 
-# ---------------------------------------------------------------- board -> host
+# =============================================================== board -> host
 [[message]]
 name = "telemetry"
 id = "0x100 + n"
@@ -26,11 +36,11 @@ mux = { byte = 0 }
   mux = 0x03
   name = "status"
   signals = [
-    { name = "state", byte = 1, type = "u8", enum = { 0 = "UNCONFIGURED", 1 = "IDLE", 2 = "RUNNING", 3 = "FAULT" }, alarm = ["FAULT"] },
-    { name = "flags", byte = 2, type = "u8", flags = { 0 = "CMD_TIMEOUT", 1 = "CAL_USED", 2 = "INVERTED", 3 = "DRV_FAULT" }, alarm = ["DRV_FAULT"] },
-    { name = "supply", byte = 3, type = "u16be", scale = 0.001, unit = "V", invalid = 0 },
+    { name = "state", byte = 1, type = "u8", enum = { 0 = "UNCONFIGURED", 1 = "IDLE", 2 = "RUNNING", 3 = "FAULT" }, alarm = ["FAULT"], log_changes = true },
+    { name = "flags", byte = 2, type = "u8", flags = { 0 = "CMD_TIMEOUT", 1 = "CAL_USED", 2 = "INVERTED", 3 = "DRV_FAULT" }, alarm = ["DRV_FAULT"], log_changes = true },
+    { name = "supply", byte = 3, type = "u16be", scale = 0.001, unit = "V", invalid = 0, decimals = 2 },
     # only boards with CAP_MEASURES_INPUT_CURRENT send these bytes
-    { name = "input_current", byte = 5, type = "i16be", scale = 0.001, unit = "A", invalid = 0x8000 },
+    { name = "input_current", byte = 5, type = "i16be", scale = 0.001, unit = "A", invalid = 0x8000, decimals = 2 },
   ]
 
   [[message.variant]]
@@ -49,11 +59,22 @@ mux = { byte = 0 }
     { name = "image_size", byte = 5, type = "u8", unit = "KB" },
   ]
 
+  # GET_CONFIG replies: byte 1 says which settings (0 = active, 1 = pending)
   [[message.variant]]
   mux = 0x21
-  name = "config"
+  when = { byte = 1, value = 0 }
+  name = "config_active"
   signals = [
-    { name = "which", byte = 1, type = "u8", enum = { 0 = "active", 1 = "pending" } },
+    { name = "node_id", byte = 2, type = "u8" },
+    { name = "flags", byte = 3, type = "u8", flags = { 0 = "INVERT", 1 = "CALIBRATION", 2 = "SENSOR_CCW", 3 = "UNSAVED" } },
+    { name = "zero_angle", byte = 4, type = "f32be", unit = "rad" },
+  ]
+
+  [[message.variant]]
+  mux = 0x21
+  when = { byte = 1, value = 1 }
+  name = "config_pending"
+  signals = [
     { name = "node_id", byte = 2, type = "u8" },
     { name = "flags", byte = 3, type = "u8", flags = { 0 = "INVERT", 1 = "CALIBRATION", 2 = "SENSOR_CCW", 3 = "UNSAVED" } },
     { name = "zero_angle", byte = 4, type = "f32be", unit = "rad" },
@@ -91,15 +112,40 @@ mux = { byte = 0 }
   name = "reboot"
   signals = [{ name = "status", byte = 1, type = "u8", enum = { 0 = "OK" } }]
 
+  # GET_BOARD_INFO: page 0 = capabilities, pages 1-5 = model name, 6 characters each
   [[message.variant]]
   mux = 0x27
+  when = { byte = 1, value = 0 }
   name = "board_info"
-  # page 0 only: capabilities + hardware revision (pages 1-5 carry the model name as text)
   signals = [
-    { name = "page", byte = 1, type = "u8" },
     { name = "caps", byte = 2, type = "u32be", flags = { 0 = "SUPPLY_V", 1 = "INPUT_I" } },
     { name = "hw_rev", byte = 6, type = "u8" },
   ]
+  [[message.variant]]
+  mux = 0x27
+  when = { byte = 1, value = 1 }
+  name = "model_1"
+  signals = [{ name = "chars", byte = 2, type = "ascii", len = 6 }]
+  [[message.variant]]
+  mux = 0x27
+  when = { byte = 1, value = 2 }
+  name = "model_2"
+  signals = [{ name = "chars", byte = 2, type = "ascii", len = 6 }]
+  [[message.variant]]
+  mux = 0x27
+  when = { byte = 1, value = 3 }
+  name = "model_3"
+  signals = [{ name = "chars", byte = 2, type = "ascii", len = 6 }]
+  [[message.variant]]
+  mux = 0x27
+  when = { byte = 1, value = 4 }
+  name = "model_4"
+  signals = [{ name = "chars", byte = 2, type = "ascii", len = 6 }]
+  [[message.variant]]
+  mux = 0x27
+  when = { byte = 1, value = 5 }
+  name = "model_5"
+  signals = [{ name = "chars", byte = 2, type = "ascii", len = 6 }]
 
   [[message.variant]]
   mux = 0xFE
@@ -114,7 +160,15 @@ mux = { byte = 0 }
   name = "error"
   signals = [{ name = "code", byte = 1, type = "f32be", decimals = 0 }]   # 1 motor init, 2 current sense, 3 FOC init, 4 driver fault
 
-# ---------------------------------------------------------------- host -> board
+# input power, computed from the heartbeat
+[[derived]]
+name = "power"
+on = "status"
+expr = "supply * input_current"
+unit = "W"
+decimals = 2
+
+# =============================================================== host -> board
 # Current command: one frame carries two nodes (odd n = bytes 0-3, even n = bytes 4-7).
 # NaN = no command for that node. The board clamps to +-2 A (MOTOR_CURRENT_LIMIT) and
 # applies 0 A if no frame arrives for 100 ms (COMMAND_TIMEOUT_MS).
@@ -123,7 +177,7 @@ name = "current_cmd"
 id = "0x010 + (n - 1) / 2"
 length = 8
 signals = [
-  { name = "current", byte = "((n - 1) % 2) * 4", type = "f32be", unit = "A", min = -2.0, max = 2.0, default = nan, stop = 0.0, decimals = 3 },
+  { name = "current", byte = "((n - 1) % 2) * 4", type = "f32be", unit = "A", min = -2.0, max = 2.0, default = nan, stop = 0.0, decimals = 2 },
 ]
 
 [[message]]
@@ -165,13 +219,13 @@ mux = { byte = 0 }
   name = "cmd_get_board_info"
   signals = [{ name = "page", byte = 1, type = "u8" }]
 
-# ---------------------------------------------------------------- outputs (sliders, sent periodically)
+# =============================================================== outputs
 [[output]]
 name = "Motor current"
 message = "current_cmd"
 period_ms = 10
 
-# ---------------------------------------------------------------- command buttons
+# =============================================================== commands
 [[command]]
 name = "Start FOC"
 id = "0x020 + n"
@@ -179,7 +233,7 @@ data = "10"
 reply_id = "0x100 + n"
 reply = "10"
 timeout_ms = 4000
-help = "Motor init + alignment (1-3 s). Reply ok = 1 / failed = 0."
+help = "Motor init + alignment (1-3 s; the wheel may move). Reply ok = 1 / failed = 0."
 
 [[command]]
 name = "Get info"
@@ -192,10 +246,12 @@ nack = "FE 20"
 [[command]]
 name = "Get board info"
 id = "0x020 + n"
-data = "27 00"
+data = "27 {page:u8}"
+args = [{ name = "page", default = 0, min = 0, max = 5 }]
 reply_id = "0x100 + n"
 reply = "27"
 nack = "FE 27"
+help = "page 0 = capabilities and hardware revision, 1-5 = model name"
 
 [[command]]
 name = "Get config"
@@ -226,7 +282,7 @@ args = [{ name = "invert", default = 0, min = 0, max = 1 }]
 reply_id = "0x100 + n"
 reply = "22"
 nack = "FE 22"
-help = "Pending until Save."
+help = "Flips the sign of the current command and the reported velocity. Pending until Save."
 
 [[command]]
 name = "Set velocity interval"
@@ -254,6 +310,7 @@ data = "23 02"
 reply_id = "0x100 + n"
 reply = "23"
 nack = "FE 23"
+help = "Forget the stored alignment: the next Start FOC aligns. Pending until Save."
 
 [[command]]
 name = "Save"
@@ -282,3 +339,317 @@ reply_id = "0x100 + n"
 reply = "26"
 nack = "FE 26"
 confirm = true
+help = "The motor stops. Unsaved changes are lost."
+
+# =============================================================== sequences (Rhai scripts)
+[[sequence]]
+name = "Info"
+help = "Firmware version, board model and capabilities"
+script = '''
+if !heard(n, 600) { warn(`node ${n}: no status received`); return; }
+let r = send("Get info", n);
+if is_none(r) { warn(`node ${n}: no GET_INFO reply - firmware 1.0 (no configuration over CAN)`); return; }
+let b = send("Get board info", n, [0]);
+let model = "";
+for p in 1..6 {
+    let page = send("Get board info", n, [p]);
+    if is_none(page) || "nack" in page { break; }
+    model += page.chars;
+    if page.chars.len() < 6 { break; }
+}
+let caps = if is_none(b) || "nack" in b { "?" } else { b.caps };
+info(`node ${n}: ${model}, firmware ${r.fw_major}.${r.fw_minor}.${r.fw_patch}, protocol ${r.protocol}, capabilities ${caps}`);
+let c = send("Get config", n, [0]);
+let p = send("Get config", n, [1]);
+if !is_none(c) && "UNSAVED" in c.flags { warn(`node ${n}: has unsaved setting changes`); }
+'''
+
+[[sequence]]
+name = "Start FOC both"
+help = "START_FOC to every motor card's node at once; they align in parallel"
+script = '''
+let targets = [];
+for c in cards {
+    if heard(c, 1000) { targets.push(c); } else { warn(`node ${c}: no status received, not starting it`); }
+}
+if targets.is_empty() { check("Start FOC both", false, "no driver online"); return; }
+let t = timestamp();
+for c in targets { send_only("Start FOC", c); }
+info(`Waiting up to 4 s for nodes ${targets} (the drivers send nothing while they align)...`);
+wait_until(|| targets.all(|x| age("start_foc.ok", x) < t.elapsed * 1000.0), 4000);
+for c in targets {
+    let fresh = age("start_foc.ok", c) < t.elapsed * 1000.0;
+    let ok = fresh && value("start_foc.ok", c) == 1.0;
+    check(`Start FOC node ${c}`, ok, if !fresh { "no reply within 4 s" } else if ok { `OK (${fmt(t.elapsed, 1)} s)` } else { "FAILED" });
+}
+'''
+
+[[sequence]]
+name = "Auto test"
+stop_after = true
+help = "Heartbeat, Start FOC, timeouts, telemetry rate, direction, partner frame, NaN and short frames. The motor spins!"
+script = '''
+let I = abs(slider("Motor current", n));
+if I < 0.05 { I = 0.3; }
+let partner = if n % 2 == 1 { n + 1 } else { n - 1 };
+let cur_id = 0x010 + (n - 1) / 2;
+release("Motor current", n);
+info(`Auto test node ${n} with ${fmt(I, 2)} A`);
+let whole = start_measure();
+
+// 1. heartbeat
+let m = measure(1000);
+let c = m.count("status", n);
+if c == 0 { check("Status heartbeat", false, `nothing from node ${n}: check the node ID, bitrate, termination and GND`); abort("no heartbeat"); }
+check("Status heartbeat", c >= 8 && c <= 12, `${c} frames in 1 s (expect 10)`);
+info(`Driver state ${text("status.state", n)}, flags ${text("status.flags", n)}`);
+let mv = value("status.supply", n);
+check("Supply voltage in the heartbeat", !is_none(mv) && mv >= 6.0 && mv <= 30.0, `${text("status.supply", n)} (expect 6-30 V)`);
+let r = send("Get info", n);
+if check("CMD_GET_INFO answered", !is_none(r), if is_none(r) { "no reply: firmware 1.0" } else { `firmware ${r.fw_major}.${r.fw_minor}.${r.fw_patch}` }) {
+    check("CAN protocol 3 or later (node IDs)", r.protocol >= 3, `protocol ${r.protocol}`);
+}
+
+// 2. Start FOC
+let r = send("Start FOC", n);
+if !check("Start FOC", !is_none(r) && r.ok == 1.0, if is_none(r) { "no reply within 4 s" } else { `reply ${r.ok}` }) { abort("FOC did not start"); }
+let m = measure(300);
+check("State is running after start", text("status.state", n) == "RUNNING", text("status.state", n));
+check("Timeout flag set while no commands are sent", m.seen("status.flags", n, "CMD_TIMEOUT"), text("status.flags", n));
+
+// 3. zero current clears the timeout; velocity telemetry rate
+drive("Motor current", n, 0.0);
+let m = measure(1000);
+check("Current commands clear the timeout flag", !("CMD_TIMEOUT" in text("status.flags", n)), text("status.flags", n));
+let vc = m.count("velocity", n);
+check("Velocity telemetry rate", vc >= 80 && vc <= 110, `${vc} frames in 1 s (expect ~100)`);
+
+// 4./5. direction
+for s in [1, -1] {
+    drive("Motor current", n, s * I);
+    wait(2000);
+    let m = measure(1000);
+    let v = m.avg("velocity.velocity", n);
+    let name = if s > 0 { "Positive current spins forward" } else { "Negative current spins backward" };
+    check(name, !is_none(v) && s * v > 2.0, `${fmt(s * I, 2)} A -> mean ${fmt(v, 2)} rad/s`);
+}
+
+// 6. the partner node's half of the current frame is ignored
+drive("Motor current", n, 0.0);
+wait(3000);
+let v0 = abs(value("velocity.velocity", n));
+drive("Motor current", partner, I);
+wait(2000);
+let v1 = abs(value("velocity.velocity", n));
+release("Motor current", partner);
+check("Partner node's half of the current frame is ignored", v1 <= v0 + 1.0, `|vel| ${fmt(v0, 2)} -> ${fmt(v1, 2)} rad/s while ${fmt(I, 2)} A sent to node ${partner}`);
+
+// 7. command timeout while spinning
+drive("Motor current", n, I);
+wait(2000);
+release("Motor current", n);
+let m = measure(400);
+check("Command timeout after 400 ms of silence", m.seen("status.flags", n, "CMD_TIMEOUT"), text("status.flags", n));
+drive("Motor current", n, 0.0);
+wait(500);
+check("Timeout clears when commands resume", !("CMD_TIMEOUT" in text("status.flags", n)), text("status.flags", n));
+
+// 8. short frames and 9. NaN are ignored
+release("Motor current", n);
+repeat_raw(cur_id, "00 00 00 00", 10, 400);
+check("4-byte current frames are ignored", "CMD_TIMEOUT" in text("status.flags", n), text("status.flags", n));
+drive("Motor current", n, 0.0);
+wait(500);
+drive("Motor current", n, NAN);
+wait(400);
+check("NaN current is ignored", "CMD_TIMEOUT" in text("status.flags", n), text("status.flags", n));
+drive("Motor current", n, 0.0);
+wait(500);
+
+// 10. START_FOC while running replies at once
+let t = timestamp();
+let r = send("Start FOC", n);
+check("START_FOC while running replies immediately", !is_none(r) && r.ok == 1.0 && t.elapsed < 0.2, `after ${fmt(t.elapsed * 1000.0, 0)} ms`);
+
+// 11. the whole run
+let w = whole.stop();
+check("No CMD_ERROR frames during the test", w.count("error", n) == 0, `${w.count("error", n)} received`);
+check("No driver fault flag during the test", !w.seen("status.flags", n, "DRV_FAULT"));
+check("No CAN bus errors reported by the adapter", w.bus_errors() == 0, `${w.bus_errors()} reported`);
+drive("Motor current", n, 0.0);
+wait(300);
+'''
+
+[[sequence]]
+name = "Bus-off test"
+stop_after = true
+help = "Unplug the CAN cable while the motor runs: the driver must stop, recover and accept commands again."
+script = '''
+let I = slider("Motor current", n);
+if abs(I) < 0.05 { I = 0.3; }
+if text("status.state", n) != "RUNNING" {
+    let r = send("Start FOC", n);
+    if is_none(r) || r.ok != 1.0 { abort("Start FOC failed"); }
+}
+drive("Motor current", n, I);
+wait(1500);
+prompt("Now UNPLUG the CAN cable for 2-5 s, then plug it back in. (waiting up to 60 s)");
+let lost = wait_until(|| age("status.state", n) > 500, 60000);
+if !check("Cable unplugged (heartbeat stopped)", lost, if lost { "detected" } else { "no gap within 60 s" }) { abort("cable test stopped"); }
+let t = timestamp();
+let back = wait_until(|| age("status.state", n) < 200, 60000);
+if !check("Driver back on the bus", back, if back { `after ${fmt(t.elapsed, 1)} s` } else { "nothing within 60 s - did it reset into DFU? (CAN_RX is BOOT0)" }) { abort("driver did not come back"); }
+let m = measure(1000);
+check("Still running (no reset)", text("status.state", n) == "RUNNING", text("status.state", n));
+check("Commands accepted again", !("CMD_TIMEOUT" in text("status.flags", n)), text("status.flags", n));
+check("Velocity telemetry resumed", m.count("velocity", n) >= 80, `${m.count("velocity", n)} frames in 1 s`);
+info("Check the serial log: it should show 'No current command for 100 ms - applying 0 A' while unplugged,");
+info("and 'CAN bus-off - attempting recovery' / 'CAN bus recovered' if the driver went bus-off.");
+'''
+
+[[sequence]]
+name = "Read settings"
+help = "Read the active and pending settings"
+script = '''
+let a = send("Get config", n, [0]);
+let p = send("Get config", n, [1]);
+if is_none(a) { warn(`node ${n}: no GET_CONFIG reply`); }
+'''
+
+[[sequence]]
+name = "Change node ID"
+args = [{ name = "new_id", default = 1, min = 1, max = 15 }]
+help = "Pending until Save & reboot. Refused if another board already uses that ID."
+script = '''
+if new_id != n && heard(new_id, 2000) {
+    abort(`Node ${new_id} is already on the bus. Two boards with the same node ID can't be told apart (only USB serial 'set node' can fix that).`);
+}
+let r = send("Set node ID", n, [new_id]);
+if is_none(r) { error("no reply"); } else if r.status != "OK" { error(`refused: ${r.status}`); } else { info(`node ${n}: node ID ${new_id} is pending - press Save & reboot`); }
+send("Get config", n, [1]);
+'''
+
+[[sequence]]
+name = "Save & reboot"
+help = "Write the pending settings to flash; the board stops its motor and reboots. This card follows a changed node ID."
+script = '''
+let pend = send("Get config", n, [1]);
+let new_id = if is_none(pend) { 0 } else { pend.node_id };
+let msg = "Save the pending settings to flash?\n\nThe board stops its motor and reboots.";
+if new_id != 0 && new_id != n { msg += `\n\nIts node ID changes from ${n} to ${new_id}; this card follows it to the new ID.`; }
+if !confirm(msg) { return; }
+release("Motor current", n);
+let r = send("Save", n);
+if is_none(r) { error("no reply to Save"); return; }
+if r.status != "OK" { error(`Save refused: ${r.status}`); return; }
+if new_id != 0 && new_id != n { set_node(new_id); }
+info("Saved - the board reboots.");
+'''
+
+[[sequence]]
+name = "Re-run alignment"
+help = "Clear the stored sensor alignment, align again with Start FOC, then store it."
+script = '''
+let a = send("Get config", n, [0]);
+let stored = !is_none(a) && "CALIBRATION" in a.flags;
+if text("status.state", n) == "RUNNING" && !stored {
+    if confirm("FOC is running with a fresh alignment (none was stored).\n\nStore it and save? The board reboots and uses it from then on.") {
+        send("Store calibration", n);
+        send("Save", n);
+    }
+    return;
+}
+if confirm("Re-running the sensor alignment takes three steps:\n\n1. Now: clear the stored alignment and save (the board reboots).\n2. Press Start FOC: with nothing stored the board aligns (the wheel moves a little).\n3. Press 'Re-run alignment' again to store the new alignment and save.\n\nDo step 1 now?") {
+    send("Clear calibration", n);
+    send("Save", n);
+}
+'''
+
+# =============================================================== the Device page
+[[card]]
+node_select = true
+instances = [
+  { title = "Left motor", node = 1, color = "#268bd2" },
+  { title = "Right motor", node = 2, color = "#d33682" },
+]
+widgets = [
+  { type = "ids", messages = ["current_cmd", "command", "telemetry"] },
+  { type = "text", small = true, text = "{model_1.chars}{model_2.chars}{model_3.chars}{model_4.chars}{model_5.chars} · fw {info.fw_major}.{info.fw_minor}.{info.fw_patch} · protocol {info.protocol}", stale_ms = 86400000, stale_text = "firmware: press Info" },
+  { type = "row", widgets = [
+    { type = "online", online = "driver online", offline = "no status" },
+    { type = "badge", signal = "status.state", stale_ms = 600, colors = { RUNNING = "green", IDLE = "gray", FAULT = "red" } },
+    { type = "value", signal = "velocity.velocity", large = true, stale_ms = 600 },
+  ] },
+  { type = "row", widgets = [
+    { type = "flags", signal = "status.flags", stale_ms = 600 },
+  ] },
+  { type = "text", text = "{status.supply}   {status.input_current}   {status.power}", stale_ms = 600, stale_text = "– V   – A   – W" },
+  { type = "text", text = "commanded: {current_cmd.current}", stale_ms = 150, stale_text = "not sending (NaN / nothing: the driver times out to 0 A)" },
+  { type = "rate", message = "current_cmd", label = "current frames from another controller", gap_warn_ms = 100 },
+  { type = "text", small = true, text = "driver errors: {count:error}   refused commands: {count:nack}" },
+  { type = "separator" },
+  { type = "button", command = "Start FOC" },
+  { type = "slider", output = "Motor current", presets = [-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0] },
+  { type = "row", widgets = [
+    { type = "button", sequence = "Auto test", confirm = "Run the auto test on node {n}? The motor WILL spin." },
+    { type = "button", sequence = "Bus-off test" },
+    { type = "button", sequence = "Info" },
+    { type = "button", open = "Settings", label = "Settings…" },
+  ] },
+]
+
+[[card]]
+title = "Both"
+widgets = [
+  { type = "row", widgets = [
+    { type = "button", sequence = "Start FOC both" },
+    { type = "link", output = "Motor current", label = "Link sliders + Send" },
+    { type = "button", action = "abort", label = "Abort test" },
+    { type = "button", action = "stop", label = "STOP both  (Esc)", danger = true },
+  ] },
+  { type = "bus" },
+]
+
+[[card]]
+title = "Velocity and current"
+widgets = [
+  { type = "plot", title = "Shaft velocity (rad/s)", seconds = 20, height = 200, min_range = 5, series = [{ signal = "velocity.velocity", node = "cards" }] },
+  { type = "plot", title = "Commanded current (A)", seconds = 20, height = 110, min_range = 0.5, series = [{ signal = "current_cmd.current", node = "cards" }] },
+]
+
+[[card]]
+title = "Log"
+widgets = [{ type = "log", height = 240 }]
+
+# opened by "Settings…" on a motor card, for that card's node
+[[card]]
+title = "Settings"
+popup = true
+widgets = [
+  { type = "ids", messages = ["command", "telemetry"] },
+  { type = "text", text = "active:   node {config_active.node_id} · {config_active.flags} · zero angle {config_active.zero_angle}", stale_ms = 86400000, stale_text = "active:   – (press Refresh)" },
+  { type = "text", text = "pending: node {config_pending.node_id} · {config_pending.flags} · zero angle {config_pending.zero_angle}", stale_ms = 86400000, stale_text = "pending: –" },
+  { type = "separator" },
+  { type = "text", small = true, text = "Change (pending until Save & reboot)" },
+  { type = "button", sequence = "Change node ID", label = "Set node" },
+  { type = "button", command = "Set invert" },
+  { type = "row", widgets = [
+    { type = "button", command = "Store calibration", label = "Store this boot's alignment" },
+    { type = "button", command = "Clear calibration", label = "Clear alignment" },
+  ] },
+  { type = "separator" },
+  { type = "text", small = true, text = "Runtime (applies at once, back to default after a reset)" },
+  { type = "button", command = "Set velocity interval", label = "Velocity telemetry (ms)" },
+  { type = "separator" },
+  { type = "row", widgets = [
+    { type = "button", sequence = "Save & reboot" },
+    { type = "button", command = "Revert" },
+    { type = "button", command = "Reboot" },
+    { type = "button", sequence = "Re-run alignment", label = "Re-run alignment…" },
+    { type = "button", sequence = "Read settings", label = "Refresh" },
+  ] },
+]
+
+[layout]
+columns = [["Left motor", "Both", "Log"], ["Right motor", "Velocity and current"]]
+widths = [1.0, 1.0]

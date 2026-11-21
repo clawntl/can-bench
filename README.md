@@ -4,11 +4,12 @@
 [CANable 2.5](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight) adapters —
 built for robotics and embedded development.** Windows, Linux and macOS. Written in Rust.
 
-![CAN Bench Device page: two motor driver nodes, current sliders and a live velocity plot](docs/images/device-dark.png)
+![CAN Bench Device page: two motor cards with state, flags and current sliders, STOP, velocity and current plots, event log](docs/images/device-dark.png)
 
 <sub>The Device page driving two <a href="https://github.com/clawntl/BLDC-Driver">BLDC-Driver</a>
-boards (here the built-in simulator, `--demo`): node table, motor-current sliders, command buttons
-and a live velocity plot — all described by one <a href="profiles/bldc-driver.toml">TOML file</a>.</sub>
+motor controllers (here the built-in simulator, `--demo`): a card per motor, STOP, live velocity and
+current plots and an event log with test results — the whole page, its buttons and its test scripts
+come from one <a href="profiles/bldc-driver.toml">TOML file</a>.</sub>
 
 ## Features
 
@@ -24,18 +25,34 @@ and a live velocity plot — all described by one <a href="profiles/bldc-driver.
   running while the window is minimised
 - **Esc stops everything**
 
-**Device page (your protocol, no code)**
-- Describe your messages in a [device profile](profiles/README.md) and get **decoded signals**,
-  a **node table** with alive/missing and alarms, **live plots** with CSV export,
-  **sliders** that are sent periodically, and **command buttons** that wait for the reply
-- Handles node-numbered IDs (`0x100 + n`), command-byte multiplexing, several nodes in one frame,
-  big/little-endian integers and floats, enums, flags and bit fields
+**Device page — your own dashboard, no code**
+- Describe your protocol in a [device profile](profiles/README.md): messages and signals with
+  node-numbered IDs (`0x100 + n`), command-byte multiplexing, several nodes in one frame,
+  big/little-endian integers and floats, enums, flags, bit fields, text and computed values
+- Build the page from **cards and widgets**: status badges, flag chips, big readouts, sliders with
+  presets that are sent periodically, command buttons that wait for the reply, scrolling plots,
+  frame-rate and gap monitors, a log — one card per node with `instances`, popup windows for settings
+- **Drag and drop** cards between columns, resize columns, hide and add cards — and save the layout
+  back into the profile
+- **Sequences**: test scripts ([Rhai](https://rhai.rs)) that send commands, drive outputs, measure,
+  ask the operator and report **PASS/FAIL** — also from the command line for a test station
+  (`--sequence "Auto test" --exit`, exit code 0/1)
+- Safety built in: **Esc / STOP** stops every output with its stop value and aborts the running
+  test; nothing restarts on its own; a warning when another node sends the same commands
 
 **Firmware updater**
 - Download the latest CANable 2.5 firmware from GitHub and flash it over USB DFU, with verify
 - Enter/leave DFU mode from the app, back up the current firmware, disable a floating BOOT0 pin
 
 <table>
+<tr>
+<td width="50%"><img src="docs/images/edit-layout.png" alt="Edit layout mode: drag handles, column resize bars and the Add palette"></td>
+<td width="50%"><img src="docs/images/settings-popup.png" alt="A Settings popup card opened from a motor card"></td>
+</tr>
+<tr>
+<td align="center"><sub>Edit layout: drag cards, resize columns, save to the profile</sub></td>
+<td align="center"><sub>A popup card (board settings) for the motor it was opened from</sub></td>
+</tr>
 <tr>
 <td width="50%"><img src="docs/images/terminal-light.png" alt="CAN Terminal page with periodic list and decoded trace"></td>
 <td width="50%"><img src="docs/images/firmware.png" alt="Firmware Update page"></td>
@@ -62,11 +79,11 @@ and a live velocity plot — all described by one <a href="profiles/bldc-driver.
 | | |
 |---|---|
 | 📘 [User guide](docs/user-guide.md) | Every page and option, drivers per platform, troubleshooting |
-| 🧩 [Device profile reference](profiles/README.md) | The TOML format, with recipes |
+| 🧩 [Device profile reference](profiles/README.md) | Messages, signals, cards, widgets, layout, sequences and every script function, with recipes |
 | 🛠 [Development notes](docs/development.md) | Code layout, threads, tests, screenshots, releases |
 | 🔌 [Adapter protocol notes](app/MECHANICS.md) | Candlelight/Slcan/DFU details the adapter code relies on |
 
-## A device profile in 10 lines
+## A device profile, briefly
 
 ```toml
 [nodes]
@@ -84,11 +101,24 @@ mux = { byte = 0 }                # byte 0 says what the frame is
     { name = "state",  byte = 1, type = "u8", enum = { 1 = "IDLE", 2 = "RUNNING", 3 = "FAULT" }, alarm = ["FAULT"] },
     { name = "supply", byte = 3, type = "u16be", scale = 0.001, unit = "V" },
   ]
+
+[[card]]                          # one card per node
+node_select = true
+instances = [{ title = "Left", node = 1, color = "#268bd2" }, { title = "Right", node = 2, color = "#d33682" }]
+widgets = [
+  { type = "row", widgets = [
+    { type = "online" },
+    { type = "badge", signal = "status.state", colors = { RUNNING = "green", FAULT = "red" } },
+    { type = "value", signal = "status.supply", large = true, stale_ms = 500 },
+  ] },
+  { type = "plot", series = [{ signal = "status.supply" }], seconds = 30 },
+]
 ```
 
-The trace then reads `101: 03 02 00 5D 6F …  ⇒ status n1: state=RUNNING supply=23.919 V`,
-node 1 appears in the node table, and both values can be plotted. See the
-[full BLDC-Driver profile](profiles/bldc-driver.toml) for outputs and commands.
+The trace then reads `101: 03 02 00 5D 6F …  ⇒ status n1: state=RUNNING supply=23.919 V`, and the
+Device page shows a card per node with a live badge, a big voltage readout and a plot. The
+[full BLDC-Driver profile](profiles/bldc-driver.toml) adds sliders, commands, a settings window and
+the Auto test and Bus-off test scripts.
 
 ## Platform support
 
@@ -115,4 +145,4 @@ Releases are made by pushing a `v*` tag — see [development notes](docs/develop
 ## Credits
 
 - CANable 2.5 firmware and its protocol: [ElmüSoft](https://github.com/Elmue/CANable-2.5-firmware-Slcan-and-Candlelight)
-- GUI: [egui / eframe](https://github.com/emilk/egui) and [egui_plot](https://github.com/emilk/egui_plot); USB: [nusb](https://github.com/kevinmehall/nusb)
+- GUI: [egui / eframe](https://github.com/emilk/egui) and [egui_plot](https://github.com/emilk/egui_plot); USB: [nusb](https://github.com/kevinmehall/nusb); scripting: [Rhai](https://rhai.rs)

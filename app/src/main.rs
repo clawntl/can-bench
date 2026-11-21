@@ -8,6 +8,7 @@ mod dfu;
 mod dfufile;
 mod periodic;
 mod profile;
+mod script;
 mod sim;
 mod slcan;
 mod timing;

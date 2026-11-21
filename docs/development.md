@@ -17,10 +17,13 @@ Linux needs `pkg-config libudev-dev libxkbcommon-dev libwayland-dev libxcb-rende
 app/src/
   main.rs        window setup, command-line flags
   app.rs         the window: CAN Terminal + Firmware pages, periodic list UI
-  app/devtab.rs  the Device page: profile state, node table, outputs, commands, signals, plot
+  app/devtab.rs  Device page state: profile, decoded signals, nodes, outputs, commands, sequences
+  app/dash.rs    Device page UI: cards in columns, widgets, edit-layout drag and drop, popups, plots
   can.rs         CanFrame, hex parsing, host filters
   periodic.rs    TxSpec (what the user typed), the saved periodic list, the Scheduler
-  profile.rs     device profiles: TOML schema, expressions, decoder, encoder, command builder
+  profile.rs     device profiles: TOML schema, expressions, decoder, encoder, command builder,
+                 card/widget/layout/sequence definitions and their validation
+  script.rs      sequences: the Rhai engine, script functions, measurement windows, reply waiting
   device.rs      adapter discovery and the worker threads (Candlelight, Slcan, demo, firmware tasks)
   candle.rs      Candlelight / gs_usb + ElmüSoft protocol over USB (nusb)
   slcan.rs       Slcan ASCII protocol over the serial port
@@ -56,6 +59,23 @@ missed slots instead of sending a burst after a stall.
 
 Decoding happens in the window thread (`DevState::on_frame`), for received and sent frames.
 
+A running **sequence** has a third thread (`script::spawn`), with its own Rhai engine:
+
+```
+ sequence thread                    window                          adapter thread
+ ───────────────                    ──────                          ──────────────
+ send(cmd) ──── Cmd::Send ───────────────────────────────────────▶ write
+     waits on a Waiter  ◀── Shared::feed (every decoded frame) ◀── Ev::Rx
+ measure(ms): a Window in Shared, filled by the same feed
+ drive/release/stop/log/confirm ── ScriptEv ──▶ poll_dev() applies them (outputs, log, dialogs)
+```
+
+`Shared` (in an `Arc<Mutex>`) holds the latest values, heartbeats, slider values, open measurement
+windows and reply waiters. Blocking script functions sleep in small steps and check the abort flag,
+and Rhai's `on_progress` hook stops loops, so Esc / Abort end a script within a few milliseconds.
+Note that frames reach `Shared` through the window thread, so a sequence only sees new data while
+the window is updating (it is, whenever the adapter delivers frames).
+
 ## Device profiles
 
 `profile.rs` compiles the TOML once on load: expressions are parsed, types checked, and an index
@@ -64,9 +84,18 @@ Decoding happens in the window thread (`DevState::on_frame`), for received and s
 (BLDC-Driver's current frame) decodes once per node. `encode_output` does the reverse, grouping
 driven nodes by ID and filling undriven nodes' slots with the signal `default`.
 
+Cards and widgets (`CardDef`, `WidgetDef`) are deserialised as they are and checked once by
+`validate_ui`: every signal key, placeholder, output, command, sequence and card a widget refers to
+must exist, so typos are load errors rather than empty widgets. Card `instances` are expanded into
+separate cards. The page draws them in `dash.rs`; `Edit layout` changes `DevState::layout` and
+**Save to profile** rewrites only the `[layout]` table with `toml_edit`, keeping comments.
+
 The format reference is [`profiles/README.md`](../profiles/README.md); keep it in step with the
-`*Def` structs in `profile.rs`. `profiles/bldc-driver.toml` is loaded by a unit test, so a broken
-example fails `cargo test`.
+`*Def` structs in `profile.rs`. Unit tests load `profiles/bldc-driver.toml` (and syntax-check its
+sequences) and every complete example in the README, so a broken example fails `cargo test`.
+
+The `--demo` simulator (`sim.rs`) implements enough of BLDC-Driver to run the whole profile,
+including the Auto test (`--sequence "Auto test" --exit` passes 20/20 against it).
 
 ## Screenshots
 
@@ -76,10 +105,13 @@ The images in `docs/images` are made by the app itself on the demo bus:
 cd app
 cargo build
 P=../profiles/bldc-driver.toml
-./target/debug/can-bench --demo --open --autopilot --profile $P --device --dark --shot-delay 6500 --screenshot ../docs/images/device-dark.png
-./target/debug/can-bench --demo --open --autopilot --profile $P --device        --shot-delay 6500 --screenshot ../docs/images/device-light.png
-./target/debug/can-bench --demo --open --autopilot --profile $P --periodic      --shot-delay 4000 --screenshot ../docs/images/terminal-light.png
-./target/debug/can-bench --firmware --shot-delay 2500 --screenshot ../docs/images/firmware.png
+D=../docs/images
+./target/debug/can-bench --demo --open --autopilot --profile $P --device --dark --shot-delay 7500 --screenshot $D/device-dark.png
+./target/debug/can-bench --demo --open --autopilot --profile $P --device        --shot-delay 7500 --screenshot $D/device-light.png
+./target/debug/can-bench --demo --open --profile $P --device --edit-layout --dark --shot-delay 2500 --screenshot $D/edit-layout.png
+./target/debug/can-bench --demo --open --profile $P --device --popup Settings --sequence "Read settings" --node 1 --shot-delay 3000 --screenshot $D/settings-popup.png
+./target/debug/can-bench --demo --open --autopilot --profile $P --periodic --shot-delay 4000 --screenshot $D/terminal-light.png
+./target/debug/can-bench --firmware --shot-delay 2500 --screenshot $D/firmware.png
 ```
 
 Point `APPDATA` (Windows) / `HOME` at an empty folder first if you do not want your own periodic

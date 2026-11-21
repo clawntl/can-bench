@@ -142,6 +142,8 @@ pub enum Ty {
     I(usize),
     F32,
     F64,
+    /// text, `len` bytes, stops at the first NUL
+    Ascii(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -188,6 +190,7 @@ impl Kind {
             Ty::U(n) | Ty::I(n) => n,
             Ty::F32 => 4,
             Ty::F64 => 8,
+            Ty::Ascii(n) => n,
         }
     }
 
@@ -245,7 +248,15 @@ impl IntOrStr {
 #[serde(deny_unknown_fields)]
 struct FileDef {
     name: Option<String>,
+    bus: Option<BusDef>,
     nodes: Option<NodesDef>,
+    #[serde(default, rename = "derived")]
+    derived: Vec<DerivedDef>,
+    #[serde(default, rename = "card")]
+    cards: Vec<CardDef>,
+    layout: Option<LayoutDef>,
+    #[serde(default, rename = "sequence")]
+    sequences: Vec<SequenceDef>,
     #[serde(default, rename = "message")]
     messages: Vec<MessageDef>,
     #[serde(default, rename = "command")]
@@ -297,9 +308,17 @@ struct MuxDef {
 #[serde(deny_unknown_fields)]
 struct VariantDef {
     mux: i64,
+    when: Option<WhenDef>,
     name: String,
     #[serde(default)]
     signals: Vec<SignalDef>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+struct WhenDef {
+    byte: usize,
+    value: i64,
 }
 
 #[derive(Deserialize)]
@@ -309,6 +328,9 @@ struct SignalDef {
     byte: IntOrStr,
     #[serde(rename = "type")]
     ty: String,
+    len: Option<usize>,
+    #[serde(default)]
+    log_changes: bool,
     bit: Option<u8>,
     bits: Option<u8>,
     #[serde(default = "one")]
@@ -359,7 +381,7 @@ fn default_reply_timeout() -> u64 {
     500
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 struct ArgDef {
     name: String,
@@ -382,6 +404,217 @@ fn default_period() -> u64 {
     100
 }
 
+/// Bus settings the profile's devices use (offered on the Device page).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct BusDef {
+    pub bitrate: u32,
+    #[serde(default = "default_sp")]
+    pub sample_point: f64,
+    pub data_bitrate: Option<u32>,
+    #[serde(default = "default_dsp")]
+    pub data_sample_point: f64,
+}
+
+fn default_sp() -> f64 {
+    87.5
+}
+
+fn default_dsp() -> f64 {
+    75.0
+}
+
+/// A value computed from other signals of the same message (Rhai expression).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedDef {
+    pub name: String,
+    /// variant (or message) whose signals the expression uses
+    pub on: String,
+    pub expr: String,
+    #[serde(default)]
+    pub unit: String,
+    pub decimals: Option<usize>,
+    pub alarm_below: Option<f64>,
+    pub alarm_above: Option<f64>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceDef {
+    pub title: String,
+    pub node: Option<i64>,
+    pub color: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+struct CardDef {
+    title: Option<String>,
+    #[serde(default)]
+    instances: Vec<InstanceDef>,
+    node: Option<i64>,
+    #[serde(default)]
+    node_select: bool,
+    color: Option<String>,
+    #[serde(default)]
+    popup: bool,
+    #[serde(default)]
+    widgets: Vec<WidgetDef>,
+}
+
+/// Which nodes a plot series shows.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum NodeSel {
+    Node(i64),
+    /// "card" = the card's node, "cards" = every card's node in its colour, "all" = every node seen
+    Word(String),
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDef {
+    pub signal: String,
+    pub node: Option<NodeSel>,
+    pub color: Option<String>,
+    pub label: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+fn plot_secs() -> f64 {
+    10.0
+}
+fn plot_h() -> f32 {
+    180.0
+}
+fn log_h() -> f32 {
+    200.0
+}
+fn gap_ms() -> u64 {
+    300
+}
+
+/// One element of a card. See profiles/README.md.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WidgetDef {
+    Text {
+        text: String,
+        #[serde(default)]
+        large: bool,
+        #[serde(default)]
+        small: bool,
+        color: Option<String>,
+        stale_ms: Option<u64>,
+        stale_text: Option<String>,
+    },
+    Value {
+        signal: String,
+        label: Option<String>,
+        #[serde(default)]
+        large: bool,
+        stale_ms: Option<u64>,
+    },
+    Badge {
+        signal: String,
+        label: Option<String>,
+        #[serde(default)]
+        colors: BTreeMap<String, String>,
+        stale_ms: Option<u64>,
+    },
+    Flags {
+        signal: String,
+        stale_ms: Option<u64>,
+    },
+    Online {
+        online: Option<String>,
+        offline: Option<String>,
+    },
+    Ids {
+        messages: Vec<String>,
+    },
+    Slider {
+        output: String,
+        signal: Option<String>,
+        label: Option<String>,
+        #[serde(default)]
+        presets: Vec<f64>,
+        #[serde(default = "yes")]
+        send_toggle: bool,
+    },
+    Button {
+        label: Option<String>,
+        command: Option<String>,
+        sequence: Option<String>,
+        open: Option<String>,
+        action: Option<String>,
+        output: Option<String>,
+        confirm: Option<String>,
+        #[serde(default = "yes")]
+        inputs: bool,
+        #[serde(default)]
+        danger: bool,
+    },
+    Link {
+        output: String,
+        label: Option<String>,
+    },
+    Plot {
+        title: Option<String>,
+        series: Vec<SeriesDef>,
+        #[serde(default = "plot_secs")]
+        seconds: f64,
+        #[serde(default = "plot_h")]
+        height: f32,
+        min_range: Option<f64>,
+        #[serde(default = "gap_ms")]
+        gap_ms: u64,
+    },
+    Log {
+        #[serde(default = "log_h")]
+        height: f32,
+    },
+    Rate {
+        message: String,
+        label: Option<String>,
+        gap_warn_ms: Option<u64>,
+    },
+    Row {
+        widgets: Vec<WidgetDef>,
+    },
+    Separator,
+    Bus,
+    Nodes,
+    Signals,
+    Outputs,
+    Commands,
+    Sequences,
+    PlotTicked,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutDef {
+    pub columns: Vec<Vec<String>>,
+    #[serde(default)]
+    pub widths: Vec<f32>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SequenceDef {
+    pub name: String,
+    pub script: String,
+    #[serde(default)]
+    args: Vec<ArgDef>,
+    #[serde(default)]
+    pub stop_after: bool,
+    pub help: Option<String>,
+}
+
 // ============================================================ compiled profile
 
 pub struct Nodes {
@@ -396,6 +629,7 @@ pub struct Nodes {
 
 pub struct Signal {
     pub name: String,
+    pub log_changes: bool,
     byte: Expr,
     kind: Kind,
     bitfield: Option<(u8, u8)>,
@@ -417,6 +651,7 @@ pub struct Signal {
 
 pub struct Variant {
     pub mux: i64,
+    when: Option<WhenDef>,
     pub name: String,
     pub signals: Vec<Signal>,
 }
@@ -458,8 +693,32 @@ pub struct Output {
     pub period_ms: u64,
 }
 
+/// A card of the Device page (card instances are expanded into separate cards).
+#[derive(Clone, Debug)]
+pub struct Card {
+    pub title: String,
+    pub node: Option<i64>,
+    pub node_select: bool,
+    pub color: Option<String>,
+    pub popup: bool,
+    pub widgets: Vec<WidgetDef>,
+}
+
+pub struct Sequence {
+    pub name: String,
+    pub script: String,
+    pub args: Vec<(String, f64, Option<f64>, Option<f64>)>,
+    pub stop_after: bool,
+    pub help: String,
+}
+
 pub struct Profile {
     pub name: String,
+    pub bus: Option<BusDef>,
+    pub derived: Vec<DerivedDef>,
+    pub cards: Vec<Card>,
+    pub layout: Option<LayoutDef>,
+    pub sequences: Vec<Sequence>,
     pub nodes: Option<Nodes>,
     pub messages: Vec<Message>,
     pub commands: Vec<Command>,
@@ -477,6 +736,9 @@ pub struct Value {
     pub num: Option<f64>,
     pub text: String,
     pub alarm: bool,
+    /// enum, flags or text: scripts get `text` rather than `num`
+    pub label: bool,
+    pub log_changes: bool,
 }
 
 /// One message decoded from one frame (a frame shared by several nodes gives one per node).
@@ -562,14 +824,214 @@ impl Profile {
             }
             outputs.push(Output { name: o.name.clone(), message: mi, period_ms: o.period_ms.clamp(1, 60_000) });
         }
-        Ok(Profile {
+        let mut cards = Vec::new();
+        for c in &def.cards {
+            let make = |title: String, node: Option<i64>, color: Option<String>| Card {
+                title,
+                node,
+                node_select: c.node_select,
+                color,
+                popup: c.popup,
+                widgets: c.widgets.clone(),
+            };
+            if c.instances.is_empty() {
+                let title = c.title.clone().ok_or("every [[card]] needs a title (or instances)")?;
+                cards.push(make(title, c.node, c.color.clone()));
+            } else {
+                for i in &c.instances {
+                    cards.push(make(i.title.clone(), i.node.or(c.node), i.color.clone().or(c.color.clone())));
+                }
+            }
+        }
+        for (i, c) in cards.iter().enumerate() {
+            if c.title.starts_with('@') {
+                return Err(format!("card \"{}\": titles starting with @ are reserved for the built-in cards", c.title));
+            }
+            if cards[..i].iter().any(|o| o.title == c.title) {
+                return Err(format!("two cards are called \"{}\"", c.title));
+            }
+        }
+        let sequences: Vec<Sequence> = def
+            .sequences
+            .iter()
+            .map(|s| Sequence {
+                name: s.name.clone(),
+                script: s.script.clone(),
+                args: s.args.iter().map(|a| (a.name.clone(), a.default, a.min, a.max)).collect(),
+                stop_after: s.stop_after,
+                help: s.help.clone().unwrap_or_default(),
+            })
+            .collect();
+        for d in &def.derived {
+            if find_msg(&d.on).is_err() && !messages.iter().any(|m| m.variants.iter().any(|v| v.name == d.on)) {
+                return Err(format!("derived \"{}\": on = \"{}\" is not a message or variant", d.name, d.on));
+            }
+        }
+        let p = Profile {
             name: def.name.unwrap_or_else(|| fallback_name.to_string()),
+            bus: def.bus,
+            derived: def.derived,
+            cards,
+            layout: def.layout,
+            sequences,
             nodes,
             messages,
             commands,
             outputs,
             index,
-        })
+        };
+        p.validate_ui()?;
+        Ok(p)
+    }
+
+    /// Every signal key the profile can produce ("variant.signal").
+    pub fn signal_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &self.messages {
+            for s in &m.signals {
+                out.push(format!("{}.{}", m.name, s.name));
+            }
+            for v in &m.variants {
+                for s in &v.signals {
+                    out.push(format!("{}.{}", v.name, s.name));
+                }
+            }
+        }
+        for d in &self.derived {
+            out.push(format!("{}.{}", d.on, d.name));
+        }
+        out
+    }
+
+    /// Names a frame can be counted by (messages and variants).
+    pub fn message_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &self.messages {
+            out.push(m.name.clone());
+            out.extend(m.variants.iter().map(|v| v.name.clone()));
+        }
+        out
+    }
+
+    fn validate_ui(&self) -> Result<(), String> {
+        let keys = self.signal_keys();
+        let names = self.message_names();
+        let card_titles: Vec<&str> = self.cards.iter().map(|c| c.title.as_str()).collect();
+        let sig = |k: &str, w: &str| -> Result<(), String> {
+            if keys.iter().any(|x| x == k) {
+                Ok(())
+            } else {
+                Err(format!("{w}: unknown signal \"{k}\" (write it as variant.signal, e.g. status.state)"))
+            }
+        };
+        fn check_text(text: &str, keys: &[String], names: &[String], w: &str) -> Result<(), String> {
+            for ph in placeholders(text) {
+                let ok = match ph.split_once(':') {
+                    Some(("count", m)) => names.iter().any(|x| x == m),
+                    Some(("hex", k)) | Some(("raw", k)) => keys.iter().any(|x| x == k),
+                    _ => matches!(ph.as_str(), "n" | "bus_errors" | "rx" | "tx") || keys.iter().any(|x| x == &ph),
+                };
+                if !ok {
+                    return Err(format!("{w}: unknown placeholder {{{ph}}}"));
+                }
+            }
+            Ok(())
+        }
+        fn walk(p: &Profile, ws: &[WidgetDef], f: &mut dyn FnMut(&WidgetDef) -> Result<(), String>) -> Result<(), String> {
+            for w in ws {
+                f(w)?;
+                if let WidgetDef::Row { widgets } = w {
+                    walk(p, widgets, f)?;
+                }
+            }
+            Ok(())
+        }
+        for c in &self.cards {
+            let wname = format!("card \"{}\"", c.title);
+            walk(self, &c.widgets, &mut |w| {
+                match w {
+                    WidgetDef::Text { text, .. } => check_text(text, &keys, &names, &wname)?,
+                    WidgetDef::Value { signal, .. } | WidgetDef::Badge { signal, .. } | WidgetDef::Flags { signal, .. } => sig(signal, &wname)?,
+                    WidgetDef::Ids { messages } => {
+                        for m in messages {
+                            if !self.messages.iter().any(|x| &x.name == m) {
+                                return Err(format!("{wname}: ids: no message called \"{m}\""));
+                            }
+                        }
+                    }
+                    WidgetDef::Slider { output, signal, .. } => {
+                        let o = self.outputs.iter().find(|o| &o.name == output).ok_or_else(|| format!("{wname}: no output called \"{output}\""))?;
+                        if let Some(s) = signal {
+                            if !self.messages[o.message].signals.iter().any(|x| &x.name == s) {
+                                return Err(format!("{wname}: output \"{output}\" has no signal \"{s}\""));
+                            }
+                        }
+                    }
+                    WidgetDef::Link { output, .. } => {
+                        if !self.outputs.iter().any(|o| &o.name == output) {
+                            return Err(format!("{wname}: no output called \"{output}\""));
+                        }
+                    }
+                    WidgetDef::Button { command, sequence, open, action, output, .. } => {
+                        let n = [command.is_some(), sequence.is_some(), open.is_some(), action.is_some()].iter().filter(|x| **x).count();
+                        if n != 1 {
+                            return Err(format!("{wname}: a button needs exactly one of command, sequence, open or action"));
+                        }
+                        if let Some(c) = command {
+                            if !self.commands.iter().any(|x| &x.name == c) {
+                                return Err(format!("{wname}: no command called \"{c}\""));
+                            }
+                        }
+                        if let Some(s) = sequence {
+                            if !self.sequences.iter().any(|x| &x.name == s) {
+                                return Err(format!("{wname}: no sequence called \"{s}\""));
+                            }
+                        }
+                        if let Some(o) = open {
+                            if !card_titles.contains(&o.as_str()) {
+                                return Err(format!("{wname}: no card called \"{o}\" to open"));
+                            }
+                        }
+                        if let Some(a) = action {
+                            if !["stop", "abort", "stop_output"].contains(&a.as_str()) {
+                                return Err(format!("{wname}: action must be stop, abort or stop_output"));
+                            }
+                            if a == "stop_output" && !output.as_ref().is_some_and(|o| self.outputs.iter().any(|x| &x.name == o)) {
+                                return Err(format!("{wname}: action stop_output needs output = an existing output"));
+                            }
+                        }
+                    }
+                    WidgetDef::Plot { series, .. } => {
+                        for s in series {
+                            sig(&s.signal, &wname)?;
+                            if let Some(NodeSel::Word(w)) = &s.node {
+                                if !["card", "cards", "all"].contains(&w.as_str()) {
+                                    return Err(format!("{wname}: plot node must be a number, \"card\", \"cards\" or \"all\""));
+                                }
+                            }
+                        }
+                    }
+                    WidgetDef::Rate { message, .. } => {
+                        if !names.iter().any(|x| x == message) {
+                            return Err(format!("{wname}: rate: no message or variant called \"{message}\""));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(l) = &self.layout {
+            for col in &l.columns {
+                for t in col {
+                    let builtin = ["@nodes", "@signals", "@plot", "@outputs", "@commands", "@sequences", "@log", "@bus"].contains(&t.as_str());
+                    if !builtin && !card_titles.contains(&t.as_str()) {
+                        return Err(format!("layout: no card called \"{t}\""));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn node_range(&self) -> Vec<i64> {
@@ -588,14 +1050,26 @@ impl Profile {
             let (variant, signals, prefix) = match m.mux_byte {
                 Some(b) => {
                     let Some(&sel) = f.data.get(b) else { continue };
-                    match m.variants.iter().position(|v| v.mux == sel as i64) {
+                    match m.variants.iter().position(|v| v.mux == sel as i64 && v.when.is_none_or(|w| f.data.get(w.byte).is_some_and(|b| *b as i64 == w.value))) {
                         Some(vi) => (Some(vi), &m.variants[vi].signals, &m.variants[vi].name),
                         None => (None, &m.signals, &m.name),
                     }
                 }
                 None => (None, &m.signals, &m.name),
             };
-            let values = signals.iter().filter_map(|s| s.decode(&f.data, n).map(|(num, text, alarm)| Value { key: format!("{prefix}.{}", s.name), num, text, alarm })).collect();
+            let values = signals
+                .iter()
+                .filter_map(|s| {
+                    s.decode(&f.data, n).map(|(num, text, alarm)| Value {
+                        key: format!("{prefix}.{}", s.name),
+                        num,
+                        text,
+                        alarm,
+                        label: !s.enums.is_empty() || !s.flags.is_empty() || matches!(s.kind.ty, Ty::Ascii(_)),
+                        log_changes: s.log_changes,
+                    })
+                })
+                .collect();
             out.push(Decoded { message: mi, variant, node, values });
         }
         out
@@ -690,6 +1164,22 @@ impl Profile {
     }
 }
 
+impl Profile {
+    /// The definition of a signal key ("variant.signal").
+    pub fn find_signal(&self, key: &str) -> Option<&Signal> {
+        let (prefix, name) = key.split_once('.')?;
+        for m in &self.messages {
+            if m.name == prefix {
+                return m.signals.iter().find(|s| s.name == name);
+            }
+            if let Some(v) = m.variants.iter().find(|v| v.name == prefix) {
+                return v.signals.iter().find(|s| s.name == name);
+            }
+        }
+        None
+    }
+}
+
 impl Message {
     pub fn id_for(&self, n: i64) -> Result<u32, String> {
         let id = self.id.eval(n)?;
@@ -702,6 +1192,11 @@ impl Message {
 }
 
 impl Signal {
+    /// Flag names in bit order, with whether each is an alarm.
+    pub fn flag_list(&self) -> Vec<(String, bool)> {
+        self.flags.values().map(|n| (n.clone(), self.alarm.contains(n))).collect()
+    }
+
     pub fn decimals(&self) -> usize {
         self.decimals.unwrap_or(if self.kind.is_float() || self.scale.fract() != 0.0 { 3 } else { 0 })
     }
@@ -711,6 +1206,11 @@ impl Signal {
         let at = usize::try_from(self.byte.eval(n).ok()?).ok()?;
         let size = self.kind.size();
         let bytes = data.get(at..at + size)?;
+        if let Ty::Ascii(_) = self.kind.ty {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            let text: String = bytes[..end].iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '?' }).collect();
+            return Some((None, text, false));
+        }
         let mut bits = self.kind.read_bits(bytes);
         if let Some((bit, len)) = self.bitfield {
             bits = (bits >> bit) & if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
@@ -718,7 +1218,7 @@ impl Signal {
         let raw: f64 = match self.kind.ty {
             Ty::F32 => f32::from_bits(bits as u32) as f64,
             Ty::F64 => f64::from_bits(bits),
-            Ty::U(_) => bits as f64,
+            Ty::U(_) | Ty::Ascii(_) => bits as f64,
             Ty::I(sz) => {
                 let width = self.bitfield.map(|b| b.1 as u32).unwrap_or(sz as u32 * 8);
                 let shift = 64 - width;
@@ -769,6 +1269,7 @@ impl Signal {
 
 fn write_value(kind: Kind, v: f64, out: &mut [u8]) -> Result<(), String> {
     let bits = match kind.ty {
+        Ty::Ascii(_) => return Err("text fields cannot be sent".into()),
         Ty::F32 => (v as f32).to_bits() as u64,
         Ty::F64 => v.to_bits(),
         Ty::U(n) => {
@@ -791,7 +1292,15 @@ fn write_value(kind: Kind, v: f64, out: &mut [u8]) -> Result<(), String> {
 }
 
 fn compile_signal(s: &SignalDef) -> Result<Signal, String> {
-    let kind = Kind::parse(&s.ty)?;
+    let kind = if s.ty.trim().eq_ignore_ascii_case("ascii") {
+        let len = s.len.filter(|l| (1..=64).contains(l)).ok_or_else(|| format!("{}: type ascii needs len = 1…64", s.name))?;
+        Kind { ty: Ty::Ascii(len), big_endian: true }
+    } else {
+        if s.len.is_some() {
+            return Err(format!("{}: len is only for type ascii", s.name));
+        }
+        Kind::parse(&s.ty)?
+    };
     let bitfield = match (s.bit, s.bits) {
         (None, None) => None,
         (bit, bits) => {
@@ -824,6 +1333,7 @@ fn compile_signal(s: &SignalDef) -> Result<Signal, String> {
     }
     Ok(Signal {
         name: s.name.clone(),
+        log_changes: s.log_changes,
         byte: s.byte.expr().map_err(|e| format!("{}: byte: {e}", s.name))?,
         kind,
         bitfield,
@@ -849,7 +1359,7 @@ fn compile_message(m: &MessageDef) -> Result<Message, String> {
     let signals = m.signals.iter().map(compile_signal).collect::<Result<Vec<_>, _>>()?;
     let mut variants = Vec::new();
     for v in &m.variants {
-        variants.push(Variant { mux: v.mux, name: v.name.clone(), signals: v.signals.iter().map(compile_signal).collect::<Result<Vec<_>, _>>().map_err(|e| format!("variant \"{}\": {e}", v.name))? });
+        variants.push(Variant { mux: v.mux, when: v.when, name: v.name.clone(), signals: v.signals.iter().map(compile_signal).collect::<Result<Vec<_>, _>>().map_err(|e| format!("variant \"{}\": {e}", v.name))? });
     }
     if !variants.is_empty() && m.mux.is_none() {
         return Err("variants need mux = { byte = … }".into());
@@ -865,6 +1375,18 @@ fn compile_message(m: &MessageDef) -> Result<Message, String> {
         length: m.length.unwrap_or(8).clamp(0, 64),
         fill: m.fill,
     })
+}
+
+/// `{name}` placeholders in a text widget.
+pub fn placeholders(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(a) = rest.find('{') {
+        let Some(b) = rest[a..].find('}') else { break };
+        out.push(rest[a + 1..a + b].trim().to_string());
+        rest = &rest[a + b + 1..];
+    }
+    out
 }
 
 fn parse_hex_prefix(s: &str) -> Result<Vec<u8>, String> {
@@ -936,7 +1458,7 @@ mod tests {
         let d = p.decode(&frame(0x102, &[0x03, 2, 0x04, 0x5D, 0xCC, 0x05, 0xDC]));
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].node, Some(2));
-        assert_eq!(p.describe(&d[0]), "status n2: state=RUNNING flags=INVERTED supply=24.012 V input_current=1.500 A");
+        assert_eq!(p.describe(&d[0]), "status n2: state=RUNNING flags=INVERTED supply=24.01 V input_current=1.50 A");
 
         // 5-byte heartbeat (no current sensor): the missing field is skipped, not shown as 0
         let d = p.decode(&frame(0x101, &[0x03, 3, 0x08, 0x5D, 0xCC]));
@@ -968,6 +1490,68 @@ mod tests {
         assert_eq!((f.id, &f.data[..]), (0x023, &[0x22, 0x10, 0x41, 0xA0, 0, 0][..]));
         let (_, rid, reply, nack) = p.reply_match(ci, 3).unwrap();
         assert_eq!((rid, reply, nack), (0x103, vec![0x22], Some(vec![0xFE, 0x22])));
+
+        // a second selector byte picks the variant (config active / pending), text fields
+        let d = p.decode(&frame(0x101, &[0x21, 1, 3, 0x09, 0, 0, 0, 0]));
+        assert_eq!(p.describe(&d[0]), "config_pending n1: node_id=3 flags=INVERT|UNSAVED zero_angle=0.000 rad");
+        let d = p.decode(&frame(0x101, &[0x27, 2, b'D', b'r', b'i', b'v', 0, 0]));
+        assert_eq!(p.describe(&d[0]), "model_2 n1: chars=Driv");
+
+        // cards, layout and sequences are all there
+        assert!(p.cards.iter().any(|c| c.title == "Left motor" && c.node == Some(1)));
+        assert!(p.cards.iter().any(|c| c.title == "Settings" && c.popup));
+        for s in &p.sequences {
+            crate::script::check(&s.script).unwrap_or_else(|e| panic!("sequence {}: {e}", s.name));
+        }
+    }
+
+    #[test]
+    fn ui_references_are_checked() {
+        let base = "[[message]]
+name = \"m\"
+id = 1
+signals = [{ name = \"x\", byte = 0, type = \"u8\" }]
+";
+        let e = Profile::parse(&format!("{base}[[card]]
+title = \"A\"
+widgets = [{{ type = \"value\", signal = \"m.y\" }}]
+"), "x").err().unwrap();
+        assert!(e.contains("unknown signal \"m.y\""), "{e}");
+        let e = Profile::parse(&format!("{base}[[card]]
+title = \"A\"
+widgets = [{{ type = \"text\", text = \"{{m.z}}\" }}]
+"), "x").err().unwrap();
+        assert!(e.contains("placeholder"), "{e}");
+        let e = Profile::parse(&format!("{base}[layout]
+columns = [[\"B\"]]
+"), "x").err().unwrap();
+        assert!(e.contains("no card called \"B\""), "{e}");
+        let e = Profile::parse(&format!("{base}[[card]]
+title = \"A\"
+widgets = [{{ type = \"buton\" }}]
+"), "x").err().unwrap();
+        assert!(e.contains("buton"), "{e}");
+        assert!(Profile::parse(&format!("{base}[[card]]
+title = \"A\"
+widgets = [{{ type = \"value\", signal = \"m.x\", large = true }}]
+"), "x").is_ok());
+    }
+
+    #[test]
+    fn readme_examples_load() {
+        // every complete example (one with a [[message]]) in profiles/README.md must load
+        let md = [include_str!("../../profiles/README.md"), include_str!("../../README.md")].concat();
+        let mut n = 0;
+        for block in md.split("```toml").skip(1) {
+            let toml = block.split("```").next().unwrap();
+            if !toml.contains("[[message]]") || toml.contains("…") {
+                continue;
+            }
+            Profile::parse(toml, "readme").unwrap_or_else(|e| panic!("README example fails: {e}
+{toml}"));
+            n += 1;
+        }
+        assert!(n >= 5, "found {n} examples");
     }
 
     #[test]

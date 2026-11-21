@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+mod dash;
 mod devtab;
 use devtab::{DevState, OUTPUT_TAG};
 
@@ -122,6 +123,7 @@ struct FwFile {
 }
 
 pub struct App {
+    ctx: egui::Context,
     tab: Tab,
     adapters: Vec<AdapterRef>,
     sel: usize,
@@ -190,6 +192,9 @@ pub struct App {
     started: Instant,
     shot_delay: Duration,
     auto: Option<devtab::Auto>,
+    start_seq: Option<(String, Option<i64>)>,
+    /// --exit: print the sequence's log and quit when it ends (exit code 1 on failure)
+    exit_after_seq: Option<usize>,
     shot_requested: bool,
     shot_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -238,6 +243,7 @@ impl App {
             dirs.push(hud);
         }
         let mut app = App {
+            ctx: cc.egui_ctx.clone(),
             tab: Tab::Terminal,
             adapters: Vec::new(),
             sel: 0,
@@ -297,6 +303,8 @@ impl App {
             started: Instant::now(),
             shot_delay: Duration::from_millis(2000),
             auto: None,
+            start_seq: None,
+            exit_after_seq: None,
             shot_requested: false,
             shot_done: Default::default(),
         };
@@ -321,6 +329,20 @@ impl App {
         }
         if args.iter().any(|a| a == "--open") {
             app.open(&cc.egui_ctx);
+        }
+        if args.iter().any(|a| a == "--edit-layout") {
+            app.dev.edit = Some(devtab::Edit { before: (app.dev.layout.clone(), app.dev.widths.clone()), drag: None });
+        }
+        if let Some(t) = arg("--popup") {
+            let opener = app.dev.profile.as_ref().and_then(|p| p.cards.iter().find(|c| !c.popup && c.node.is_some()).map(|c| c.title.clone()));
+            let n = opener.as_ref().map(|o| app.dev.card_node(o)).unwrap_or(app.dev.sel_node);
+            app.dev.popups.push((t, n, opener));
+        }
+        if let Some(name) = arg("--sequence") {
+            app.start_seq = Some((name, arg("--node").and_then(|n| n.parse().ok())));
+            if args.iter().any(|a| a == "--exit") {
+                app.exit_after_seq = Some(0);
+            }
         }
         if args.iter().any(|a| a == "--autopilot") {
             app.auto = Some(devtab::Auto::default());
@@ -420,6 +442,31 @@ impl App {
         self.adapters.get(self.sel).cloned()
     }
 
+    /// Bus settings from a device profile (adapter must be closed).
+    fn apply_bus(&mut self, b: &crate::profile::BusDef) {
+        if self.link.is_some() {
+            return;
+        }
+        if NOMINAL.contains(&b.bitrate) {
+            self.nom_baud = b.bitrate;
+        } else {
+            self.nom_baud = 0;
+            self.nom_custom = b.bitrate;
+        }
+        self.nom_sp = b.sample_point;
+        self.fd = b.data_bitrate.is_some();
+        if let Some(d) = b.data_bitrate {
+            if DATA.contains(&d) {
+                self.data_baud = d;
+            } else {
+                self.data_baud = 0;
+                self.data_custom = d;
+            }
+            self.data_sp = b.data_sample_point;
+        }
+        self.note(Kind::Note, &format!("Bus settings from the profile: {} baud, {:.1} %", crate::timing::fmt_baud(b.bitrate as f64), b.sample_point));
+    }
+
     fn baud(&self, data: bool) -> u32 {
         if data {
             if self.data_baud == 0 { self.data_custom } else { self.data_baud }
@@ -481,6 +528,10 @@ impl App {
                 Ev::Info(s) => self.push(at, Kind::Info, s),
                 Ev::Text(s) => self.push(at, Kind::Text, s),
                 Ev::Error(s, lvl) => {
+                    if lvl >= 1 {
+                        self.dev.bus_errors += 1;
+                        self.dev.shared.lock().unwrap().bus_error();
+                    }
                     if s.starts_with("Bus ") || s.starts_with("Back to") {
                         self.bus_state = (s.split(',').next().unwrap_or("").to_string(), lvl);
                     }
@@ -560,8 +611,9 @@ impl App {
             self.bus_state = ("Closed".into(), 0);
             // never resume driving outputs by itself when the adapter is opened again
             for o in &mut self.dev.outputs {
-                o.on = false;
+                o.nodes.clear();
             }
+            self.abort_sequence();
         }
     }
 
@@ -628,7 +680,7 @@ impl App {
         if !any {
             return;
         }
-        self.stop_outputs(None);
+        self.stop_everything();
         for e in &mut self.periodic {
             e.on = false;
         }
@@ -826,6 +878,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_link();
         self.poll_fw();
+        self.poll_dev();
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.stop_periodic();
@@ -881,6 +934,19 @@ impl eframe::App for App {
             Tab::Firmware => self.firmware_ui(ui, &ctx),
         }
 
+        if self.is_open && self.start_seq.is_some() {
+            let (name, node) = self.start_seq.take().unwrap();
+            match self.dev.profile.as_ref().and_then(|p| p.sequences.iter().position(|s| s.name == name)) {
+                Some(si) => {
+                    let n = node.or_else(|| self.dev.card_node_list().first().copied()).unwrap_or(self.dev.sel_node);
+                    if self.exit_after_seq.is_some() {
+                        self.exit_after_seq = Some(self.dev.log.len());
+                    }
+                    self.run_sequence(si, n, None);
+                }
+                None => self.note(Kind::Err, &format!("--sequence: the profile has no sequence called \"{name}\"")),
+            }
+        }
         if self.auto.is_some() {
             self.autopilot();
             ctx.request_repaint_after(Duration::from_millis(50));

@@ -81,6 +81,7 @@ impl Sim {
         let tel = 0x100 + nd.n;
         let Some(&cmd) = f.data.first() else { return out };
         let reply = match cmd {
+            0x10 if nd.state == 2 => Some(with_f32(vec![0x10], 1.0)),
             0x10 => {
                 nd.foc_done_at = Some(now + std::time::Duration::from_millis(1200));
                 None
@@ -146,7 +147,9 @@ impl Sim {
                 }
             }
             let timed_out = nd.last_cmd.is_none_or(|c| now.duration_since(c).as_millis() > 100);
-            let i = if nd.state == 2 && !timed_out { nd.current } else { 0.0 };
+            // invert flips the command and the reported velocity, like the firmware
+            let cmd = if nd.invert { -nd.current } else { nd.current };
+            let i = if nd.state == 2 && !timed_out { cmd } else { 0.0 };
             // torque ∝ current, viscous friction, a little load ripple
             let load = 0.8 * (t * 1.7 + nd.n as f32).sin();
             let accel = 60.0 * i - 1.5 * nd.velocity - load;
